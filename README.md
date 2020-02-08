@@ -2,6 +2,8 @@
 ## Analysis Code
 ## Spencer Nystrom
 
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3660090.svg)](https://doi.org/10.5281/zenodo.3660090)
+
 This initial release is for generating a DOI of the code base for submission.
 Very soon I will push the analysis notebook which reproduces all genomics
 figures in the main text with full explanations of how everything works.
