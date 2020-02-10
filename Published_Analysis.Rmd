@@ -1,0 +1,3378 @@
+---
+title: "Published Analysis"
+output: html_notebook
+---
+
+First run: "R_Pipeline/00_Runall.R"
+
+```{r setup, echo=F, prompt=F}
+source("R_Pipeline/pipeline_methods.R")
+source("Scripts/importMatrix.R")
+source("Scripts/FigUtils.R")
+source("R_Pipeline/make_gviz_browser_shots.R")
+
+library(cowplot)
+theme_set(theme_gray())
+n_threads <- 4
+setup_packages(n_threads = n_threads)
+library(here)
+Sys.setenv(MEME_DIR = "/home/snystrom/meme")
+Sys.setenv(TOMTOM_DB = here("Data/fly_factor_survey_id.meme"))
+
+# load pipeline output files
+lapply(Sys.glob("R_Pipeline/output_data/*.rda"), load, .GlobalEnv)
+
+times <- c("3LW", "0APF", "6APF", "18APF", "24APF", "36APF", "44APF")
+times_nozero <- c("3LW", "6APF", "18APF", "24APF", "36APF", "44APF")
+developmental_time_factor <- factor(times, levels = times)
+developmental_time_factor_nozero <- factor(times_nozero, levels = times_nozero)
+
+# Additional timepoint information from full WT timecourse
+extra_sampleSheet <- readr::read_tsv("Data/allTimes_SampleSheet.tsv") %>% 
+  dplyr::mutate(grp = paste0(Genotype, ".", Time)) %>% 
+  dplyr::mutate(Bigwig = gsub("FAIRE_Data/Data/BigWigs/", "Data/Extra_Bigwigs/", Bigwig)) %>% 
+  dplyr::mutate(BigwigZnorm = gsub("FAIRE_Data/Data/BigWigs/", "Data/Extra_Bigwigs/", BigwigZnorm)) %>% 
+  dplyr::mutate(Bam = gsub("FAIRE_Data/Data/Bam/", "Data/Extra_Bam/", Bam)) %>% 
+  #dplyr::select(-Bam) %>% 
+  data.frame
+
+# replace 3lw data with correct samples
+or.3lw_entry <- peakTable %>% 
+  dplyr::filter(grp == "OR.3LW") %>% 
+  dplyr::select(-Bam, -Peakfile, -Assay, -Sample)
+
+extra_peakTable <- readr::read_tsv("Data/allTimes_PeakTable.tsv") %>% 
+  dplyr::mutate(grp = paste0(Genotype, ".", Time)) %>% 
+  dplyr::mutate(BigwigZnorm = gsub("FAIRE_Data/Data/BigWigs/", "Data/Extra_Bigwigs/", BigwigZnorm)) %>% 
+  dplyr::select(-Peakfile) %>% 
+  dplyr::filter(grp != "OR.3LW") %>% 
+  data.frame %>% 
+  dplyr::bind_rows(., or.3lw_entry)
+
+ptm_sampleSheet <- readr::read_tsv("histone_ptm_samplesheet.tsv") %>% 
+  dplyr::mutate(BigwigZnorm = paste0("Data/", BigwigZnorm)) %>% 
+  dplyr::mutate(Bigwig = paste0("Data/", Bigwig)) %>% 
+  dplyr::mutate(Sample = gsub("-", "\\.", Sample)) %>% 
+  data.frame
+
+#############
+# colorscheme for consequences of binding & FAIRE regions
+# for WT behavior:
+increasing_color = "forestgreen" 
+decreasing_color = "firebrick" 
+static_color = "dodgerblue4"
+
+# for behavior in response to precocious E93:
+gof_increasing_color = "#0092ff" 
+gof_decreasing_color = "#ffa700" 
+gof_static_color = "grey50"
+
+# Generic genome highlight color
+genome_highlight_color = "grey75"
+
+behavior_colors <- c("Increasing" = increasing_color, "Decreasing" = decreasing_color, "Static" = static_color)
+gof_behavior_colors <- c("Increasing" = gof_increasing_color, "Decreasing" = gof_decreasing_color, "Static" = gof_static_color)
+
+
+toOrphan <- function(df, col = peak_binding_description){
+# For converting peak_binding_description to "orphan" from "orphan_endogenous"
+# this is to pay down some tech-debt that I realized too late to change original assignment.
+  col <- enquo(col)
+  
+  df %>% 
+    dplyr::mutate(!!col := gsub("_endogenous", "", !!col))
+}
+
+## DEVELOPMENT Guidelines:
+# fig size max: 180 mm x 210 mm (7.08 in x 8.26 in)
+# 8pt arial for all text
+# 12pt uppercase for labels
+theme_development <- theme(text = element_text(size = 8, family = "Arial"),
+                           axis.text = element_text(size = 8, family = "Arial"),
+                           strip.text = element_text(size = 8, family = "Arial"), 
+                           plot.tag = element_text(size = 12, family = "Arial"))
+
+pt_to_mm <- function(pt){
+  # Convert ggplot2 size from mm to pt
+  # named this function poorly to start, now too late to change.
+  pt * 0.352778
+}
+```
+
+# 02 ChIP Analysis
+
+```{r echo=F, prompt=F}
+source("R_Pipeline/pipeline_methods.R")
+setup_packages(n_threads = n_threads)
+chip_peakTableList <- chip_peakTable %>% 
+  split(., .$grp)
+theme_set(theme_grey())
+set.seed(1892825)
+```
+
+## Color Setup
+```{r}
+# ChIP Dataset colors:
+exogenous_chip_color <- "#6b6b6b"
+wt_chip_color <- "#3a3a3a"
+
+# peak_binding_category Colorscheme:
+ectopic_color <- "#058ED9"
+endogenous_color <- "#0ABF6A"
+orphan_color <- "#A59B86"
+
+binding_colors <- c(ectopic_color, endogenous_color, orphan_color)
+names(binding_colors) <- c("ectopic", "entopic", "orphan_endogenous")
+
+binding_colors_faire <- binding_colors[c(1,2)]
+binding_colors_faire["faire"] <- "grey"
+binding_colors_faire["faire"] <- "grey"
+binding_colors_faire["orphan"] <- binding_colors["orphan_endogenous"]
+
+# faire-seq colorscheme:
+wt_3lw_faire_color <- "#6FD259"
+wt_24apf_faire_color <- "#D247C5"
+wt_44apf_faire_color <- "black"
+exogenous_faire_color <- "#55ceea"
+
+```
+
+```{r, fig.height=5, fig.width=5}
+chip_repOv <- peak_overlaps_by_condition(chip_allPeaks_by_rep %>% split(mcols(.)$grp))
+
+addGrpToPeaks <- function(x){
+  peaks <- map(x, "mergedPeaks") %>% 
+    map(., data.frame) %>% 
+    imap(., ~{
+      name <- .y
+      df <- .x
+      
+      df %>% 
+        dplyr::mutate(grp = name)
+    }) %>% 
+    map(., GRanges)
+  
+  return(peaks)
+}
+
+repOv_peaks <- addGrpToPeaks(chip_repOv)
+
+wt_ov_gof <- ChIPpeakAnno::findOverlapsOfPeaks(repOv_peaks)
+
+ChIPpeakAnno::makeVennDiagram(wt_ov_gof) 
+```
+
+```{r, fig.height=5, fig.width=5}
+library(VennDiagram)
+shared <- wt_ov_gof$peaklist$`OR.24APF///E93GOF.3LW`$peakNames %>% 
+  paste(., collapse = "_") %>% 
+  as.character()
+A <- wt_ov_gof$peaklist$OR.24APF$peakNames %>% as.character() %>% c(., shared)
+B <- wt_ov_gof$peaklist$E93GOF.3LW$peakNames %>% as.character() %>% c(., shared)
+
+ov_list <- list("A" = A, "B" = B)
+# configure venn diagram parameters to get the plot looking right
+venn <- venn.diagram(ov_list, filename = NULL, 
+                           category = c("Wild-Type\nE93 Late ChIP", "Precocious\nE93 Early ChIP"),
+                           fontfamily = "sans",
+                           cat.pos = c(200,180), 
+                           cat.dist = c(.08, 0.02),
+                           cat.fontfamily = "sans",
+                           cat.face = "bold", 
+                           ext.length = 0.9, 
+                           ext.line.lwd = 2) 
+```
+
+```{r, fig.height=5, fig.width=5}
+# get the venn diagram as spatial polygon
+vennParts <- get_venn_parts(venn)
+# new plot with 3 color fill & good labels.
+plot_chip_category_venn <- function(){
+  #dev.new(width = 5, height = 5)
+  par(mar = c(0,0,0,5), xpd = NA)
+  
+  labs <- vennParts$labs
+  
+  plot_3color_venn(vennParts, c(ectopic_color, endogenous_color, orphan_color), lwd = 2)
+  
+  # Append category label to count labels
+  sample <- c("Ectopic", "Orphan", "Entopic")
+  labs$lab <- labs$label %>% as.vector()
+  labs$lab[1:3] <- paste0(sample, "\n", labs$lab[1:3])
+  labs$label <- labs$lab %>% factor(.)
+  
+  counts <- labs[c(1, 3),]
+  
+  orphan_count <- labs[2,]
+  orphan_count$y <- counts$y[1]
+  titles <- labs[4:5,]
+  titles$y[2] <-  titles$y[2] - 0.1 # move WT title down a bit
+  
+  text(counts$x, counts$y + 0.02, counts$label)
+  text(orphan_count$x + 0.14, orphan_count$y + 0.02, orphan_count$label)
+  text(titles$x, titles$y + 0.05, titles$label, col = c("black", "black"))
+}
+plot_chip_category_venn()
+```
+
+```{r}
+allChipPeaks <- annotate_overlap_status(wt_ov_gof, by = "grp") %>% 
+  lapply(., function(peaks){
+    peaks %>% 
+      data.frame %>% 
+      dplyr::mutate(peak_binding_description = case_when(.$peak_status == "OR.24APF_unique" ~ "orphan_endogenous",
+                                                  .$peak_status == "E93GOF.3LW_unique" ~ "ectopic",
+                                                  .$peak_status == "shared" & .$grp == "OR.24APF" ~ "entopic", 
+                                                  .$peak_status == "shared" & .$grp == "E93GOF.3LW" ~ "na"))
+  }) %>% 
+  dplyr::bind_rows(.) 
+```
+
+```{r, fig.height=5, fig.width=4.5}
+library(forcats)
+
+plotData <- allChipPeaks %>% 
+  dplyr::filter(grp == "OR.24APF") %>% 
+  dplyr::mutate(peak_binding_description = case_when(.$peak_binding_description == "orphan_endogenous" ~ "Unbound",
+                                                     .$peak_binding_description == "entopic" ~ "Bound")) 
+
+axis_data <- plotData %>% 
+  dplyr::group_by(peak_binding_description) %>% 
+  dplyr::count() %>% 
+  tidyr::spread(peak_binding_description, n) %>% 
+  dplyr::mutate(total = Bound + Unbound)
+
+percentBound <- round((axis_data$Bound / axis_data$total) * 100)
+
+breaks <- c(axis_data$Bound, axis_data$total)
+
+plotData %>% 
+  ggplot(aes(factor("WT E93\nLate binding sites"))) +
+    geom_bar(aes(fill = fct_rev(peak_binding_description))) +
+    xlab(NULL) +
+    ylab(glue::glue("{percentBound}%\nBound")) +
+    theme_minimal() +
+    theme(text = element_text(color = "black"), 
+          axis.text = element_text(color = "black", size = 15), 
+          axis.line = element_line(color = "black"), 
+          panel.grid.major = element_blank(),
+          axis.title.y = element_text(angle = 0, 
+                                      vjust = percentBound/100 + 0.035, 
+                                      size = 14)) +
+    guides(fill = guide_legend(title = "Bound by\nPrecocious E93", title.hjust = 0.5)) +
+    scale_fill_manual(values  = c("Bound" = "Black", "Unbound" = "Grey")) +
+    scale_y_continuous(breaks = breaks, expand = c(0,0)) 
+```
+
+```{r}
+unionChip <- allChipPeaks %>% 
+  GRanges %>% 
+  GenomicRanges::reduce(.)
+
+endogenous <- allChipPeaks %>% 
+  dplyr::filter(peak_binding_description == "entopic") %>% 
+  GRanges
+
+ectopic <- allChipPeaks %>% 
+  dplyr::filter(peak_binding_description == "ectopic") %>% 
+  GRanges
+
+orphan_endogenous <- allChipPeaks %>% 
+  dplyr::filter(peak_binding_description == "orphan_endogenous") %>% 
+  GRanges
+
+unionChip %<>% 
+  data.frame %>% 
+  dplyr::mutate(id = glue::glue("peak_{num}", num = seq(1:nrow(.))) %>% as.character(.)) %>% 
+  dplyr::mutate(peak_binding_description = case_when(GRanges(.) %over% endogenous ~ "entopic", 
+                                                     GRanges(.) %over% ectopic ~ "ectopic",
+                                                     GRanges(.) %over% orphan_endogenous ~ "orphan_endogenous")) %>%
+  GRanges
+
+unionChip %>% 
+  data.frame %>% 
+  dplyr::count(peak_binding_description) 
+  
+
+```
+
+```{r}
+chip_anno <- Rsubread::createAnnotationFile(unionChip)
+chip_counts <- Rsubread::featureCounts(chip_sampleSheet$Bam, 
+                                       annot.ext = chip_anno, 
+                                       allowMultiOverlap = T, 
+                                       nthreads = n_threads)
+
+faire_counts_in_chipPeaks <- Rsubread::featureCounts(sampleSheet$Bam, 
+                                       annot.ext = chip_anno, 
+                                       allowMultiOverlap = T, 
+                                       nthreads = n_threads)
+
+colnames(chip_counts$counts) <- chip_sampleSheet$Sample
+colnames(faire_counts_in_chipPeaks$counts) <- sampleSheet$Sample
+```
+
+```{r}
+library(DESeq2)
+chip_dds <- DESeqDataSetFromMatrix(countData = chip_counts$counts, colData = chip_sampleSheet, design = ~grp) %>% 
+  DESeq(.)
+faire_chip_dds <- DESeqDataSetFromMatrix(countData = faire_counts_in_chipPeaks$counts, colData = sampleSheet, design = ~grp) %>% 
+  DESeq(.)
+```
+```{r}
+chip_res <- results(chip_dds)
+summary(chip_res)
+```
+
+```{r}
+chip_cpm <- fpm(chip_dds)
+chip_faire_cpm <- fpm(faire_chip_dds)
+
+mean_cpm <- function(cpm, prefix = "", suffix = "_cpm", idCol = "id", 
+                     sample_regex = ".+\\..+\\..+\\.",
+                     rep_regex = "\\.Rep\\d"){
+  # requires colnames to be of form <genotype>.<time>.<tissue>.<Rep#>
+  mean_cpm <- cpm %>% 
+    data.frame %>% 
+    tibble::rownames_to_column(idCol) %>% 
+    reshape2::melt(variable.name = "Sample_Rep", value.name = "cpm") %>% 
+    dplyr::mutate(grp = gsub(rep_regex, "", Sample_Rep)) %>%
+    dplyr::mutate(Rep = gsub(sample_regex, "", Sample_Rep)) %>% 
+    dplyr::group_by(id, grp) %>% 
+    dplyr::summarise(cpm = mean(cpm)) %>% 
+    dplyr::mutate(grp = paste0(prefix, grp, suffix)) %>% 
+    tidyr::spread(key = grp, value = cpm) %>% 
+    data.frame
+ return(mean_cpm) 
+}
+
+chip_mean_cpm <- mean_cpm(chip_cpm, prefix = "chip_cpm_", suffix = "")
+chip_faire_mean_cpm <- mean_cpm(chip_faire_cpm, prefix = "faire_cpm_", suffix = "")
+
+unionChip %<>% 
+  data.frame %>% 
+  dplyr::left_join(., chip_mean_cpm, by = "id") %>% 
+  dplyr::left_join(., chip_faire_mean_cpm, by = "id") 
+```
+
+
+```{r}
+peakTable_split <- peakTable %>% split(.$Sample)
+chip_peakTable_split <- chip_peakTable %>% split(.$Sample)
+```
+
+Orphan sites tend to increase accessibility
+```{r, fig.height=5, fig.width=5}
+peakType_behavior <- unionChip %>% 
+  dplyr::mutate(ratio = faire_cpm_OR.24APF.Wing/faire_cpm_OR.3LW.Wing) %>% 
+  ggplot(aes(gsub("_endogenous", "", peak_binding_description), log2(ratio))) +
+    geom_violin(aes(fill = peak_binding_description)) +
+    geom_boxplot(aes(group = peak_binding_description), notch = T, width = 0.15) +
+    xlab(NULL) +
+    ylab("log2(WT Late/WT Early) (cpm)") +
+    ggtitle(sprintf("FAIRE Signal Early \U1f81a Late")) +
+    theme(text = element_text(size = 18), 
+          plot.title = element_text(face = "plain", size = 18),
+          axis.text.x = element_text(color = "black", size = 18),
+          legend.position = "none") +
+    scale_fill_manual(values = binding_colors) 
+
+peakType_behavior
+```
+
+```{r}
+chip_allRes <- generate_DESeq2_contrast_strings(chip_sampleSheet) %>% 
+  generate_DESeq2_contrasts(chip_dds, ., lfcCutoff = 1, padjCutoff = 0.05, format = "DataFrame")
+```
+
+```{r}
+chip_faire_allRes <- generate_DESeq2_contrast_strings(sampleSheet) %>% 
+  generate_DESeq2_contrasts(faire_chip_dds, ., lfcCutoff = 1, padjCutoff = 0.05, format = "DataFrame")
+```
+
+
+**E93-dependent** defined as differentially acessible in WT vs E93mut @ 3LW or 24APF. Not using 44APF to avoid off-target/heterochronic effects.
+
+**E93-sensitive** defined as different between E93-ectopic & WT @ 3LW.
+```{r}
+dm3.txdb <- TxDb.Dmelanogaster.UCSC.dm3.ensGene::TxDb.Dmelanogaster.UCSC.dm3.ensGene
+
+
+unionChip_anno <- unionChip %>% 
+  dplyr::mutate(e93_dependent = case_when((chip_faire_allRes$OR.3LWvsE93mut.3LW$behavior_type %in% c("Increasing", "Decreasing")) ~ "dependent",
+                                          (chip_faire_allRes$OR.24APFvsE93mut.24APF$behavior_type %in% c("Increasing", "Decreasing")) ~ "dependent",
+                                          T ~ "independent")) %>% 
+  dplyr::mutate(e93_sensitive = case_when((chip_faire_allRes$OR.3LWvsE93GOF.3LW$behavior_type %in% c("Increasing", "Decreasing")) ~ "sensitive",
+                                           T ~ "insensitive")) %>% 
+  dplyr::mutate(e93_response_category = paste0(e93_dependent, "_", e93_sensitive)) %>% 
+  dplyr::mutate(e93_sensitive_behavior = chip_faire_allRes$OR.3LWvsE93GOF.3LW$behavior_type) %>% 
+  dplyr::mutate(wt_l3_24_dynamic_behavior = chip_faire_allRes$OR.3LWvsOR.24APF$behavior_type) %>% 
+  GRanges(.) %>% 
+  ChIPseeker::annotatePeak(., tssRegion = c(-500,500), TxDb = dm3.txdb, level = "gene") %>% 
+  ChIPseeker::as.GRanges(.) %>% 
+  data.frame %>% 
+  dplyr::mutate(anno_simple = gsub(" \\(.+$", "", annotation)) 
+
+
+
+
+    
+unionChip_anno %>% 
+  dplyr::summarize(dep = sum(e93_dependent == "dependent"),
+                   sens = sum(e93_sensitive == "sensitive"),
+                   all = sum(e93_dependent %in% c("dependent", "independent")),
+                   both = sum(e93_response_category == "dependent_sensitive")) %>% 
+  dplyr::summarise(dep_frac = both/dep, sens_frac = both/sens, dep_all = dep/all, sens_all = sens/all)
+
+```
+
+## compute summit positions
+Compute summit within each peak for each ChIP dataset. d = 125 because MACS2 reads were extended to 125. This function gives the same result as MACS2 summit calls. The advantage is that it can reidentify summits after making a union peak list.
+
+For default `summitPos` use WT summits when available.
+```{r}
+
+resummit <- function(peaks, bam, d, ...){
+  # outputs vector in order of peaks of summitPos
+  summits <- peaks %>% 
+    FunChIP::pileup_peak(., bamf = bam, d = d, ...) %>% 
+    FunChIP::summit_peak(.) %>% 
+    data.frame %>% 
+    .$summit_spline
+  
+  return(summits)
+}
+
+unionChip_anno$wtSummits <- resummit(unionChip_anno %>% GRanges, chip_peakTableList$OR.24APF$Bam, d = 125)
+unionChip_anno$e93EctopicSummits <- resummit(unionChip_anno %>% GRanges, chip_peakTableList$E93GOF.3LW$Bam, d = 125)
+
+unionChip_anno %<>% 
+  dplyr::mutate(summitPos = pmap_dbl(list(peak_binding_description, wtSummits, e93EctopicSummits),
+                                 ~{
+                                   desc <- ..1
+                                   wt <- ..2
+                                   ectopic <- ..3
+                                   ifelse(desc == "ectopic", ectopic, wt)
+                                 }
+  ))
+```
+```{r}
+# add Z-score signal inside peaks 
+unionChip_anno %<>% 
+  dplyr::mutate(chip_zscore_OR.24APF.Wing = get_bw_score(chip_peakTableList$OR.24APF$BigwigZnorm, GRanges(.))) %>% 
+  dplyr::mutate(chip_zscore_E93GOF.3LW.Wing = get_bw_score(chip_peakTableList$E93GOF.3LW$BigwigZnorm, GRanges(.))) 
+```
+
+# WT Timecourse FAIRE Signal
+
+```{r}
+# get faire signal in each peak at each time:
+extra_peakTable %<>% 
+  dplyr::mutate(colName = paste0("timecourse_", grp, "_faire_signal")) 
+  
+faire_timecourse_bw_signal <- map(extra_peakTable %>% 
+                                    split(.$colName), ~{
+  sample <- .$Sample
+  bw <- .$BigwigZnorm
+  
+  get_bw_score(bw, GRanges(unionChip_anno))
+})
+
+unionChip_anno <- bind_cols(unionChip_anno, faire_timecourse_bw_signal)
+```
+
+```{r, fig.height=5, fig.width=5}
+library(VennDiagram)
+
+shared <- unionChip_anno %>% 
+  dplyr::filter(peak_binding_description == "entopic") %>% 
+  .$id
+A <- unionChip_anno %>% 
+  dplyr::filter(peak_binding_description != "orphan_endogenous") %>% 
+  .$id
+B <- unionChip_anno %>% 
+  dplyr::filter(peak_binding_description != "ectopic") %>% 
+  .$id
+
+ov_list <- list("A" = A, "B" = B)
+# configure venn diagram parameters to get the plot looking right
+venn2 <- venn.diagram(ov_list, filename = NULL, 
+                           #category = c("Wild-Type\nE93 Late ChIP", "Precocious\nE93 Early ChIP"),
+                           category = c("Precocious\nE93 Early ChIP", "Wild-Type\nE93 Late ChIP"),
+                           fontfamily = "sans",
+                           cat.pos = c(200,180), 
+                           cat.dist = c(.08, 0.02),
+                           cat.fontfamily = "sans",
+                           cat.face = "bold", 
+                           ext.length = 0.9, 
+                           ext.line.lwd = 2) 
+```
+
+```{r, fig.height=5, fig.width=5}
+# get the venn diagram as spatial polygon
+vennParts <- get_venn_parts(venn2)
+# new plot with 3 color fill & good labels.
+plot_chip_category_venn2 <- function(){
+  #dev.new(width = 5, height = 5)
+  par(mar = c(0,0,0,5), xpd = NA)
+  
+  labs <- vennParts$labs
+  
+  plot_3color_venn(vennParts, c(ectopic_color, endogenous_color, orphan_color), lwd = 2)
+  
+  # Append category label to count labels
+  sample <- c("Ectopic", "Orphan", "Entopic")
+  labs$lab <- labs$label %>% as.vector()
+  labs$lab[1:3] <- paste0(sample, "\n", labs$lab[1:3])
+  labs$label <- labs$lab %>% factor(.)
+  
+  counts <- labs[c(1, 3),]
+  
+  orphan_count <- labs[2,]
+  orphan_count$y <- counts$y[1]
+  titles <- labs[4:5,]
+  titles$y[2] <-  titles$y[2] - 0.29 # move WT title down a bit
+  
+  text(counts$x, counts$y + 0.02, counts$label)
+  text(orphan_count$x + 0.14, orphan_count$y + 0.02, orphan_count$label)
+  text(titles$x + 0.2, titles$y + 1.03, titles$label, col = c("black", "black"))
+}
+plot_chip_category_venn2()
+```
+
+# motif enrichment in chip categories?
+
+```{r}
+outdir <- "Motif_Data/deseq/chip_peak_categories-100bp/"
+region_size <- 100
+chip_category_seq_narrow <- unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  split(., mcols(.)$peak_binding_description) %>% 
+  write_fasta_of_region(., outdir, resize_bp = region_size)
+```
+
+So, I screwed up here and didn't realize setting a random seed wouldn't properly
+reproduce identical results until it was too late to fix the code on the back
+end. Regardless, before making publication figures, I ran this code multiple
+times using different seeds and get very consistent results across runs.
+Different variations on similar motifs are discovered & matched on each
+iteration and it does not change the overall conclusions drawn from these data.
+What this **does** mean is that some of the code below which is specific to 1
+run of this analysis will not be perfectly reproduced on rerunning this code (in
+particular Fig S5).
+
+I have saved the results used in the publication as an R data object which is saved in this repository.
+
+For reproducibility purposes when I knit this notebook, I will set this chunk to
+not run, and instead load from the Rdata object.
+```{r, eval=F}
+# generated w/ sample(1:100000000, 1)
+#set.seed(28399342) 
+set.seed(84729947) 
+#set.seed(24783540) 
+chip_category_seq_narrow.v.shuffle_dreme <- bplapply(chip_category_seq_narrow, function(seq){
+  motifAnalysis(seq, "shuffle", tt_evalue = 10)
+})
+set.seed(Sys.time())
+```
+```{r}
+load("Data/2019.10.23_chip_category_seq_narrow.v.shuffle_dreme.rda")
+```
+
+```{r, fig.height=15, fig.width=20}
+chip_category_seq_narrow.v.shuffle_dremeSummary <- chip_category_seq_narrow.v.shuffle_dreme %>% 
+  imap(., ~{
+    
+    dreme <- .x
+    title <- glue::glue("{.y} vs shuffle")
+     
+    dreme$info %<>% 
+      forceBestMatch("Eip93F")
+    
+    title_plot <- ggdraw() + 
+      draw_text(title, size = 20, fontface = "bold")
+    
+    cowplot::plot_grid(title_plot, dreme_summary_plot(dreme, method = "prob"), nrow = 2, rel_heights = c(0.1,1))
+  })
+chip_category_seq_narrow.v.shuffle_dremeSummary
+```
+
+
+```{r}
+# FIMO scanning E93 motif
+# read raw tsv into stdin, pass through readr, compute qvalue yourself in R
+
+dev_e93_fimo <- runFimoGenome("Motif_Data/e93_allMotifs.meme", "/DATA/dm3_genome_files/dm3.fa", "/DATA/FlyFactorMotifs/dm3_background_freq")
+```
+
+
+```{r}
+# This chunk results in a list column containing a vector of all qValues for each motif that overlaps a chip peak
+
+# This is an annoying carryover, this variable is called e93_core_fimo
+# what it actually contains is all the matches to the E93-FlyFactor motif.
+# I was playing around with different PWMs to use and never corrected this naming.
+e93_core_fimo <- dev_e93_fimo %>% 
+  dplyr::filter(motif_id != "E93_Core")
+
+motifOv <- function(ranges, motifs){
+  ov <- findOverlaps(GRanges(ranges), GRanges(motifs))
+  
+  ov_df <- ov %>% 
+    data.frame() %>% 
+    dplyr::group_by(queryHits) %>% 
+    tidyr::nest() %>% 
+    dplyr::mutate(hitsVector = purrr::map(data, "subjectHits")) %>% 
+    dplyr::select(-data)
+  
+  motifMatchDf <- ranges %>% 
+    dplyr::mutate(id = 1:nrow(.)) %>% 
+    #dplyr::inner_join(., ov_df, by = c("id" = "queryHits")) %>% 
+    dplyr::left_join(., ov_df, by = c("id" = "queryHits")) %>% 
+    # get all q values associated with overlap
+    dplyr::mutate(motif_qVal = map(hitsVector, ~{motifs[unlist(.),]$q.value})) %>% 
+    dplyr::mutate(motif_pVal = map(hitsVector, ~{motifs[unlist(.),]$p.value})) %>% 
+    dplyr::mutate(motif_score = map(hitsVector, ~{motifs[unlist(.),]$score})) 
+  
+  return(motifMatchDf)
+}
+
+dev_uca_e93Motif <- motifOv(unionChip_anno, e93_core_fimo)
+summit_uca_e93Motif <- unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  resize(20, fix = "center") %>% 
+  data.frame %>% 
+  motifOv(., e93_core_fimo)
+```
+
+Comparison of motif pvalues between binding categories
+```{r, fig.height=4, fig.width=4}
+(e93_pval_20bpSummit <- summit_uca_e93Motif %>% 
+  tidyr::unnest(motif_pVal) %>% 
+  dplyr::mutate(type = peak_binding_description) %>% 
+  toOrphan(., type) %>%  
+  ggplot(aes(type, -log10(motif_pVal))) +
+    geom_violin(aes(fill = peak_binding_description)) +
+    geom_boxplot(width = 0.1, notch = T) +
+    theme_cowplot() +
+    theme(legend.position = "none") +
+    scale_fill_manual(values = binding_colors) +
+    labs(x = NULL,
+         y = "-log10(Motif pValue)"))
+  
+test_res <- oneway.test(motif_pVal ~ peak_binding_description, data = e93_pval_20bpSummit$data) %>% 
+  broom::tidy() %>% 
+  dplyr::mutate(label = ifelse(p.value < 0.05, "*", "n.s."),
+                y = 6.2,
+                x = 2)
+```
+
+
+```{r, fig.height=4, fig.width=3}
+e93_pval_20bpSummit +
+  geom_text(data = test_res, 
+            aes(x = x, y = y, label = label),
+            size = 12 / .pt) +
+  ggtitle(glue::glue(test_res$method %>% 
+                       as.character() %>% 
+                       gsub("\\(", "\n(", .),
+                     "\np = ", 
+                     test_res$p.value %>% 
+                       round(., 2))) +
+  theme(plot.title = element_text(face = "plain",
+                                  size = 28 / .pt))
+
+```
+
+
+```{r, fig.height=3, fig.width=4}
+motif_count_cumdist <- summit_uca_e93Motif %>% 
+  dplyr::mutate(nHits = map_dbl(motif_qVal, length)) %>% 
+  toOrphan() %>% 
+  ggplot(aes(nHits)) +
+    stat_ecdf(aes(color = peak_binding_description), size = 1) + 
+    theme_cowplot() +
+    theme(legend.position = c(0.7, 0.5)) +
+    labs(y = "Fraction of Peaks",
+         x = "Number of E93 Motifs",
+         color = NULL) +
+    scale_color_manual(values = binding_colors_faire) +
+    scale_x_continuous(breaks = scales::pretty_breaks(6))
+
+motif_count_cumdist + 
+  ylim(0,1)
+```
+
+-----------------
+
+# 03 Consequences of binding
+```{r}
+avSignal_colors_rename <- c("WT Early" = "#6FD259", "WT Late" = "#D247C5", "Precocious E93 Early" = "#55ceea")
+```
+
+
+# compute faire summits for chip peaks
+```{r}
+faire_summits <- peakTable %>% 
+  dplyr::filter(Genotype %in% c("OR", "E93GOF")) %>% 
+  dplyr::filter(Time %in% c("3LW", "24APF")) %>% 
+  dplyr::mutate(summits = map(Bam, ~{
+    resummit(GRanges(unionChip_anno), bam = ., d = 125) 
+  }))
+```
+
+```{r}
+faire_summit_cols <- faire_summits %>% 
+  dplyr::mutate(colName = glue::glue("summit_faire_{grp}")) %>% 
+  dplyr::select(colName, summits) %>% 
+  tidyr::spread(colName, summits) %>% 
+  tidyr::unnest()
+
+unionChip_anno %<>% 
+  dplyr::bind_cols(., faire_summit_cols)
+```
+
+
+```{r}
+faire_avSig <- unionChip_anno %>% 
+  dplyr::filter(!is.na(e93_sensitive_behavior)) %>% 
+  dplyr::filter(peak_binding_description %in% c("entopic", "ectopic")) %>% 
+  GRanges %>% 
+  computeSummits(., "summit_faire_E93GOF.3LW") %>% 
+  split(., mcols(.)$e93_sensitive_behavior) %>% 
+  get_signal_data(extra_peakTable, extra_peakTable$BigwigZnorm, .)
+
+faire_avSig_byPeakType <- unionChip_anno %>% 
+  dplyr::filter(!is.na(e93_sensitive_behavior)) %>% 
+  #dplyr::filter(peak_binding_description == "entopic") %>% 
+  tidyr::unite("type", c("peak_binding_description", "e93_sensitive_behavior"), sep = "|") %>% 
+  GRanges %>% 
+  computeSummits(., "summit_faire_E93GOF.3LW") %>% 
+  split(., mcols(.)$type) %>% 
+  get_signal_data(extra_peakTable, extra_peakTable$BigwigZnorm, .)
+```
+
+```{r, fig.height=3, fig.width=10}
+
+gof_affected_avgSignal <- faire_avSig %>% 
+  dplyr::filter(Genotype %in% c("E93GOF", "OR")) %>% 
+  dplyr::mutate(grp = gsub("OR", "WT", grp)) %>% 
+  dplyr::mutate(grp = gsub("E93GOF", "Precocious E93", grp)) %>% 
+  dplyr::mutate(grp = gsub("\\.", " ", grp)) %>% 
+  #dplyr::filter(Time %in% c("3LW", "18APF", "24APF")) %>% 
+  dplyr::filter(Time %in% c("3LW", "24APF")) %>% 
+  dplyr::mutate(grp = gsub("24APF", "Late", grp) %>% 
+                  gsub("3LW", "Early", .)) %>% 
+  ggplot(aes(position, mean)) +
+    geom_line(aes(color = grp), size = 1) +
+    facet_wrap(~desc, scales = "free_y") +
+    xlab(NULL) +
+    ylab("FAIRE Signal (Z-Score)") +
+    theme_minimal() +
+    theme(axis.line = element_line(color = "black"), 
+          panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(), 
+          panel.spacing.x = unit(1, "lines"),
+          text = element_text(size = 13, color = "black"), 
+          strip.text.x = element_text(size = 15, color = "black"),
+          axis.text = element_text(size = 13, color = "black")) +
+    scale_color_manual(values = avSignal_colors_rename) +
+    scale_x_continuous(breaks = c(-1000, -500, 0, 500, 1000), labels = c(-1000, "", "summit", "", 1000)) +
+    guides(color = guide_legend(title = ""))
+
+gof_affected_avgSignal
+```
+## Individual panels
+```{r, fig.height=5, fig.width=5.5}
+gof_affected_behavior_counts <- unionChip_anno %>% 
+  dplyr::filter(peak_binding_description %in% c("entopic", "ectopic")) %>% # don't include orphan sites since they're unbound
+  dplyr::count(e93_sensitive_behavior) %>% 
+  split(.$e93_sensitive_behavior)
+
+gof_affected_avgSignal_legend <- cowplot::get_legend(gof_affected_avgSignal)
+gof_affected_avgSignal_byBehavior <- faire_avSig %>% 
+  dplyr::filter(Genotype %in% c("E93GOF", "OR")) %>% 
+  dplyr::mutate(grp = gsub("OR", "WT", grp)) %>% 
+  dplyr::mutate(grp = gsub("E93GOF", "Precocious E93", grp)) %>% 
+  dplyr::mutate(grp = gsub("\\.", " ", grp)) %>% 
+  #dplyr::filter(Time %in% c("3LW", "18APF", "24APF")) %>% 
+  dplyr::filter(Time %in% c("3LW", "24APF")) %>% 
+  dplyr::mutate(grp = gsub("24APF", "Late", grp) %>% 
+                  gsub("3LW", "Early", .)) %>% 
+  split(.$desc) %>% 
+  lapply(., function(x){
+    
+    desc <- x$desc %>% unique
+    anno_n <- gof_affected_behavior_counts[[desc]]$n %>% prettyNum(., big.mark = ",")
+    anno_text <- glue::glue("n = {anno_n}")
+    
+    x %>% 
+      dplyr::mutate(desc = glue::glue("{desc} in\nPrecocious E93")) %>% 
+      ggplot(aes(position, mean)) +
+        geom_line(aes(color = grp), size = 1) +
+        facet_wrap(~desc, scales = "free_y") +
+        annotate("text", 350, 5, label = anno_text, hjust = 0, vjust = 0, size = 5) +
+        xlab(NULL) +
+        ylab("FAIRE Signal (Z-Score)") +
+        theme_minimal() +
+        theme(axis.line = element_line(color = "black"), 
+              panel.grid.major = element_blank(),
+              panel.grid.minor = element_blank(), 
+              panel.spacing.x = unit(1, "lines"),
+              text = element_text(size = 13, color = "black"), 
+              strip.text.x = element_text(size = 15, color = "black"),
+              axis.text = element_text(size = 13, color = "black")) +
+        scale_color_manual(values = avSignal_colors_rename) +
+        scale_x_continuous(breaks = c(-1000, -500, 0, 500, 1000), labels = c(-1000, "", "summit", "", 1000)) +
+        guides(color = F) + 
+        #ylim(-0.147, 6)
+        ylim(-0.147, 6.5)
+        #ylim(-0.2, 7)
+  })
+
+gof_affected_avgSignal_byBehavior
+```
+
+## concordance barplots
+
+```{r}
+sigThresh <- 0.05
+
+unionChip_anno <- chip_faire_allRes$OR.3LWvsOR.24APF %>% 
+  dplyr::mutate(subthreshold_behavior_type = case_when(.$padj < sigThresh & .$log2FoldChange < 0  ~ "Increasing",
+                                                       .$padj < sigThresh & .$log2FoldChange > 0  ~ "Decreasing",
+                                                       .$padj > sigThresh ~ "Static",
+                                                       is.na(.$padj) ~ "NA")) %>% 
+  dplyr::select(id, subthreshold_behavior_type, log2FoldChange) %>% 
+  dplyr::rename(subthreshold_wt_l3_24_dynamic_behavior = subthreshold_behavior_type,
+                lfc_wt_l3_24_faire = log2FoldChange) %>% 
+  dplyr::left_join(unionChip_anno, ., by = "id") 
+```
+
+
+```{r}
+# use this plot to format legend for extraction later
+concordance_barplot <- unionChip_anno %>% 
+  dplyr::filter(peak_binding_description != "orphan_endogenous") %>% 
+  dplyr::filter(!is.na(e93_sensitive_behavior) & !is.na(wt_l3_24_dynamic_behavior)) %>% 
+  ggplot(aes(e93_sensitive_behavior)) +
+    geom_bar(aes(fill = fct_rev(wt_l3_24_dynamic_behavior)), position = "fill") +
+    scale_fill_manual(values = behavior_colors) +
+    guides(fill = guide_legend(title = "Accessibility\nChange\nin Wild-Type\nTimecourse", 
+                               title.hjust = 0.5, 
+                               title.theme = element_text(size = 15, angle = 0),
+                               label.theme = element_text(size = 13, angle = 0))) +
+  theme(legend.position = c(0,0.7))
+
+
+concordance_barplot
+```
+
+```{r}
+concordance_barplots_data <- unionChip_anno %>% 
+  #dplyr::filter(!is.na(e93_sensitive_behavior) & !is.na(wt_l3_24_dynamic_behavior)) %>% 
+  dplyr::filter(!is.na(e93_sensitive_behavior)) %>% 
+  dplyr::filter(peak_binding_description %in% c("entopic", "ectopic")) %>% 
+  dplyr::mutate(gof_behavior = e93_sensitive_behavior) %>% 
+  dplyr::mutate(gof_behavior_type = case_when(.$gof_behavior == "Static" ~ "Not Changing",
+                                              .$gof_behavior == "Increasing" ~ "Opening",
+                                              .$gof_behavior == "Decreasing" ~ "Closing")) %>% 
+  dplyr::group_by(e93_sensitive_behavior) %>% 
+  tidyr::nest() 
+```
+
+```{r, fig.height=5, fig.width=4}
+library(cowplot)
+theme_set(theme_cowplot())
+
+concordance_barplot_legend <- cowplot::get_legend(concordance_barplot)
+
+concordance_barplots_wt.subthresh <- concordance_barplots_data$data %>% 
+  purrr::map(., ~{
+    df <- .
+    
+    behavior <- df$gof_behavior %>% unique 
+    num_peaks <- nrow(df)
+   
+    ##### 
+    # For plotting percentage of each category on barplot.
+    # removing regions with n < 5 because it causes overplotting of labels. 
+    # Might remove in future, but this works for small categories
+    behavior_counts <- df %>% 
+      #dplyr::filter(!is.na(wt_l3_24_dynamic_behavior)) %>% 
+      dplyr::count(subthreshold_wt_l3_24_dynamic_behavior) %>% 
+      dplyr::mutate(breaks = cumsum(n)) %>% 
+      dplyr::filter(n > 5) 
+    
+    concordant_frac <- behavior_counts %>% 
+      dplyr::mutate(frac = breaks/num_peaks,
+                    breaks = floor(frac * 100) / 100) # round down for percentages
+                    #breaks = signif(frac, 2)) # round down for percentages
+      
+    #####
+    
+    df %>% 
+      dplyr::left_join(concordant_frac, by = "subthreshold_wt_l3_24_dynamic_behavior") %>% 
+      dplyr::mutate(gof_behavior_label = glue::glue("Peaks\n{gof_behavior_type}\nin\nExogenous E93")) %>% 
+      {
+      ggplot(., aes(gof_behavior_label)) +
+        geom_bar(aes(fill = fct_rev(subthreshold_wt_l3_24_dynamic_behavior))) +
+        xlab(NULL) +
+        ylab("Number of Peaks") +
+        scale_y_continuous(expand = c(0,0),
+                           breaks = behavior_counts$breaks,
+                           sec.axis = sec_axis(~ . /num_peaks, name = "Fraction", breaks = concordant_frac$breaks)) + # add frac max axis
+        #theme(axis.text.x = element_text(color = gof_behavior_colors[[behavior]],
+        theme(axis.text.x = element_text(color = "black",
+                                         size = 18)) +
+        guides(fill = F) +
+        scale_fill_manual(values = behavior_colors) 
+      }
+          
+  })
+
+names(concordance_barplots_wt.subthresh) <- concordance_barplots_data$e93_sensitive_behavior
+concordance_barplots_wt.subthresh
+```
+
+
+## Fig2 Browser shots
+
+
+```{r}
+gof_affected_avgSignal.alt <- gof_affected_avgSignal +
+  theme(legend.position = c(0.6,0.4)) +
+  guides(color = guide_legend(title = "FAIRE Signal"))
+gof_affected_avgSignal_legend.alt <- cowplot::get_legend(gof_affected_avgSignal.alt)
+```
+
+```{r}
+concordance_barplot.alt <- concordance_barplot +
+  theme(legend.position = c(0.15,0.5), legend.title.align = 0.5) +
+  guides(fill = guide_legend(title = paste0("Accessibility Change\nDuring Wild-Type\nDevelopment\n(Early ", sprintf("\U1f81a"), "Late)"),
+                             title.hjust = 0 
+                             ))
+concordance_barplot_legend.alt <- cowplot::get_legend(concordance_barplot.alt)
+```
+
+```{r}
+add_avSig_legend <- function(plot){
+  plot +
+    theme(legend.position = c(0.2,0.8)) +
+    aes(linetype = grp) +
+    scale_color_manual(name = NULL,
+      labels = c("Precocious E93 Early", "WT Early", "WT Late"),
+      values = c(exogenous_faire_color, wt_3lw_faire_color, wt_24apf_faire_color)) +
+    scale_linetype_manual(name = NULL,
+      labels = c("Precocious E93 Early", "WT Early", "WT Late"),
+      values = c(1,1,4)) +
+    guides(linetype = guide_legend(override.aes = list(size = 0.1, alpha = 1)),
+           color = guide_legend(override.aes = list(alpha = 1, size = 1))) 
+}
+gof_affected_avgSignal_byBehavior_internalLegend <- map(gof_affected_avgSignal_byBehavior, add_avSig_legend)
+
+```
+Collect metadata for browser shots
+```{r}
+browser_info <- bind_rows(peakTable, chip_peakTable) %>% 
+  dplyr::filter(Genotype %in% c("OR", "E93GOF"), Time %in% c("3LW", "24APF")) %>% 
+  dplyr::mutate(id = glue::glue("{Genotype}.{Time}.{Assay}")) %>% 
+  dplyr::arrange(desc(Assay), Time, desc(Genotype)) %>% 
+  dplyr::mutate(genotype_label = case_when(.$Genotype == "OR" ~ "WT",
+                                           .$Genotype == "E93GOF" ~ "Precocious E93")) %>% 
+  dplyr::mutate(Time_simple = case_when(.$Time == "24APF" ~ "Late",
+                                 .$Time == "3LW" ~ "Early")) %>% 
+  dplyr::mutate(Time = case_when(.$Time == "24APF" ~ "24h APF",
+                                 .$Time == "3LW" ~ "3LW")) %>% 
+  #dplyr::mutate(id = glue::glue("{genotype_label} {Time_simple}")) # original 
+  dplyr::mutate(id = glue::glue("{genotype_label} - {Time}"))
+
+chip_info <- browser_info %>% 
+  dplyr::filter(Assay == "ChIP") %>% 
+  dplyr::mutate(id = gsub("WT", "WT E93", id)) %>% 
+  dplyr::mutate(color = ifelse(Genotype == "OR", wt_chip_color, exogenous_chip_color))
+
+faire_info <- browser_info %>% 
+  dplyr::filter(Assay == "FAIRE") %>% 
+  dplyr::mutate(color = case_when(.$Sample == "OR.3LW.Wing" ~ wt_3lw_faire_color,
+                                  .$Sample == "OR.24APF.Wing" ~ wt_24apf_faire_color,
+                                  .$Sample == "E93GOF.3LW.Wing" ~ exogenous_faire_color))
+```
+
+```{r, fig.height=3, fig.width=11}
+source("R_Pipeline/make_gviz_browser_shots.R")
+
+mckay_enh <- import.bed("Data/mckaylab_cloned_enhancers.bed")
+
+brdisc_enhancer <- mckay_enh %>% 
+  data.frame %>% 
+  dplyr::filter(grepl("br_A", name)) %>% 
+  dplyr::mutate(name = stringr::str_replace(name, "_A", "-disc")) %>% 
+  GRanges
+
+(br_enhancer_browser <- plot_label_chip_faire(brdisc_enhancer, 
+                                               ext = c(10000,10000), 
+                                               faire_ylim = c(-1,20),
+                                               chip_ylim = c(-1,15),
+                                               anno_font.cex = 1))
+```
+
+```{r, fig.height=3, fig.width=11}
+tnc_enhancers <- mckay_enh %>% 
+  data.frame %>% 
+  dplyr::filter(grepl("tnc_[A|B]", name)) %>% 
+  dplyr::mutate(name = stringr::str_replace(name, "_A", "-blade"),
+                name = stringr::str_replace(name, "_B", "-wv")) %>% 
+  GRanges
+
+(tnc_enhancers_browser <- plot_label_chip_faire(tnc_enhancers, 
+                                                ext = c(5000,5000), 
+                                                chip_ylim = c(-1,25),
+                                                anno_font.cex = 0.68))
+```
+```{r, fig.height=3, fig.width=11}
+fig2_static_region <- data.frame(seqnames = "chr3L", start = 13205339, end = 13214292) %>% 
+  dplyr::mutate(start = start - 2500,
+                end = end + 2500) %>% 
+  GRanges 
+
+fig2_static_regions <- subsetByOverlaps(GRanges(unionChip_anno), fig2_static_region) %>% 
+  data.frame %>% 
+  dplyr::filter(e93_sensitive_behavior == "Static") %>% 
+  GRanges
+
+(fig2_static_region_browser <- plot_label_chip_faire(fig2_static_regions, 
+                                                ext = c(4000,4000), 
+                                                chip_ylim = c(0,10),
+                                                faire_ylim = c(0,10),
+                                                anno_font.cex = 0, 
+                                                anno_fill = "white"))
+```
+
+
+
+
+```{r, fig.height=5, fig.width=25}
+#fig2.long.rel_widths <- c(11/25,5/25,2.5/25,3.5/25) # browser | avsig | barplot | legend
+fig2.long.rel_widths <- c(5/25,11/25,2.5/25,3.5/25)  # avsig   |browser| barplot | legend
+fig2.long.top2 <- cowplot::plot_grid(br_enhancer_browser, NULL, rel_heights = c(0.9, 0.1), nrow = 2) %>%  # Original
+  cowplot::plot_grid(
+                   gof_affected_avgSignal_byBehavior_internalLegend$Decreasing, 
+                   .,
+                   concordance_barplots_wt.subthresh$Decreasing + 
+                     theme(axis.text.x = element_blank(), 
+                           axis.ticks.x = element_blank(), 
+                           plot.title = element_text(face = "plain")) + 
+                     ggtitle("Peaks Decreasing\nin\nPrecocious E93"), 
+                   concordance_barplot_legend.alt,
+                   nrow = 1,
+                   rel_widths = fig2.long.rel_widths,
+                   labels = c("A", "C", "E", NULL)) %>% 
+  cowplot::plot_grid(., NULL, rel_heights = c(0.9, 0.1), ncol = 1)
+
+fig2.long.mid2 <- cowplot::plot_grid(tnc_enhancers_browser, NULL, rel_heights = c(0.9, 0.1), nrow = 2) %>% 
+  cowplot::plot_grid(
+                   gof_affected_avgSignal_byBehavior_internalLegend$Increasing, 
+                   .,
+                   concordance_barplots_wt.subthresh$Increasing + 
+                     theme(axis.text.x = element_blank(), 
+                           axis.ticks.x = element_blank(),
+                           plot.title = element_text(face = "plain"))+ 
+                     ggtitle("Peaks Increasing\nin\nPrecocious E93"), 
+                   concordance_barplot_legend.alt,
+                   nrow = 1,
+                   #rel_widths = c(.8,2,.4,.4), 
+                   rel_widths = fig2.long.rel_widths,
+                   labels = c("B", "D", "F", NULL)) %>% 
+  cowplot::plot_grid(., NULL, rel_heights = c(0.9, 0.1), ncol = 1)
+
+
+fig2.long.bottom2 <- cowplot::plot_grid(fig2_static_region_browser, NULL, rel_heights = c(0.9, 0.1), nrow = 2) %>% 
+  cowplot::plot_grid(
+                   gof_affected_avgSignal_byBehavior_internalLegend$Static, 
+                   .,
+                   concordance_barplots_wt.subthresh$Static + 
+                     theme(axis.text.x = element_blank(), 
+                           axis.ticks.x = element_blank(),
+                           plot.title = element_text(face = "plain"))+ 
+                     ggtitle("Static Peaks\nin\nPrecocious E93"), 
+                   concordance_barplot_legend.alt,
+                   nrow = 1,
+                   rel_widths = fig2.long.rel_widths,
+                   labels = c("G", "H", "I", NULL)) %>% 
+  cowplot::plot_grid(., NULL, rel_heights = c(0.9, 0.1), ncol = 1)
+
+```
+
+```{r, fig.height=15, fig.width=25}
+(fig2.long2 <- cowplot::plot_grid(fig2.long.top2, fig2.long.mid2, fig2.long.bottom2, nrow = 3))
+```
+
+```{r, fig.height=3, fig.width=8}
+nubVein <- mckay_enh %>% 
+  data.frame %>% 
+  dplyr::filter(name == "nub1") %>% 
+  dplyr::mutate(name = "nub-vein") %>% 
+  GRanges
+```
+```{r, fig.height=3, fig.width=10}
+fig5.nubVein_browser <- plot_label_chip_faire(nubVein, ext = c(3000,5000), 
+                   faire_ylim = c(-1,8),
+                   chip_ylim = c(-1, 10),
+                   anno_fill = "black",
+                   anno_font.cex = 0.8, width = 10) %>% 
+  cowplot::plot_grid(., labels = "E")
+
+fig5.nubVein_browser
+```
+
+
+# 04 Figures
+# Fig. 3 
+
+## Browser shot of ChIP peaks
+
+```{r}
+#browser_locus <- data.frame("seqnames" = "chrX", "start" = 575628 , "end" = 629400) %>% 
+# ORIGINAL LOCUS:
+#browser_locus <- data.frame("seqnames" = "chrX", "start" = 579800 , "end" = 618715) %>% 
+
+browser_locus <- data.frame("seqnames" = "chr2L", "start" = 376990 , "end" = 377212) %>% 
+  GRanges %>% 
+  promoters(., 10000, 20000)
+
+browser_highlights <- unionChip_anno %>% 
+  GRanges(.) %>% 
+  subsetByOverlaps(., browser_locus) %>% 
+  split(., mcols(.)$peak_binding_description)
+
+# join labels w/ colors for color vector
+fig1_chip_colors <- chip_info$color
+names(fig1_chip_colors) <- chip_info$id
+```
+
+```{r, fig.height=1.5, fig.width=10}
+
+fig1_chip_tracks <- gviz_chip_tracks(browser_locus, ylim = c(-1,10))
+fig1_highlights <- browser_highlights %>% 
+  data.frame %>% 
+  bind_rows() %>% 
+  GRanges
+
+axis <- Gviz::GenomeAxisTrack(col = "grey30", scale = 25000)
+
+tracks <- Gviz::HighlightTrack(browser_highlights, 
+                     trackList = fig1_chip_tracks, 
+                     alpha = 0.2,
+                     col = NA,
+                     fill = binding_colors[fig1_highlights$peak_binding_description])
+Gviz::plotTracks(c(axis, tracks), 
+               chromosome = seqnames(browser_locus) %>% as.character(),
+               from = start(browser_locus), 
+               to = end(browser_locus),
+               showTitle = F)
+
+```
+
+```{r, fig.height=5, fig.width=5}
+plot_chip_category_venn2()
+chip_category_venn <- recordPlot()
+```
+
+
+```{r, fig.height=5, fig.width=5}
+chip_peak_ov_venn <- ggdraw(chip_category_venn) +
+  draw_plot_label("B") 
+
+chip_peak_ov_venn
+```
+
+## Average signal fig3
+
+
+```{r, fig.height=3, fig.width=10}
+avSig_by_binding <- unionChip_anno %>% 
+  dplyr::group_by(peak_binding_description) %>% 
+  tidyr::nest_legacy() %>% 
+  dplyr::mutate(ranges = map(data, GRanges),
+                summits = map(ranges, computeSummits),
+                avSig = map(summits, ~{
+                  get_signal_data(chip_info, chip_info$BigwigZnorm, .)
+                })) %>% 
+  tidyr::unnest_legacy(avSig)
+```
+
+
+```{r, fig.height=3, fig.width=6}
+chip_avSig <- avSig_by_binding %>% 
+  dplyr::mutate(id = paste0(genotype_label, "\n", Time, " E93-ChIP")) %>% 
+  dplyr::mutate(id = gsub("WT", "Wild-Type", id)) %>% 
+  dplyr::mutate(peak_binding_description = gsub("_endogenous", "", peak_binding_description)) %>% 
+  ggplot(aes(position, mean)) +
+    geom_line(aes(color = peak_binding_description), size = 1) +
+    facet_wrap(~id, scales = "free_y") +
+    scale_color_manual(values = binding_colors_faire) +
+    guides(color = guide_legend(override.aes = list(size = 1))) +
+    scale_x_continuous(labels = c(-1000, "summit", 1000),
+                       breaks = c(-1000, 0, 1000)) +
+    labs(color = NULL, 
+         y = "ChIP Z-Score",
+         x = NULL) +
+    theme(strip.background.x = element_blank(),
+          legend.position = c(0.01, 0.8)) 
+
+chip_avSig
+
+```
+
+# 05 Clustering
+
+```{r}
+library(ComplexHeatmap)
+```
+
+## Cluster peaks by WT behavior fracmax then interrogate overlap w/ E93 functional categories
+
+```{r}
+wildtype_faire_ss <- extra_sampleSheet %>% 
+  dplyr::filter(Lab == "Buttita") 
+
+timecourse_samplesheet <- sampleSheet %>% 
+  dplyr::filter(Genotype == "OR", Time == "3LW") %>% 
+  dplyr::select(names(wildtype_faire_ss)) %>% 
+  dplyr::bind_rows(., wildtype_faire_ss) %>% 
+  dplyr::mutate(Time = factor(Time, levels = times_nozero)) %>% 
+  dplyr::mutate(Genotype = ifelse(Genotype == "OR", "WT", Genotype)) %>% 
+  tidyr::unite(Sample, c("Genotype", "Time", "Rep"), remove = F)
+
+timecourse_samplesheet
+```
+
+```{r}
+timecourse_faire_counts <- Rsubread::featureCounts(timecourse_samplesheet$Bam, 
+                                       annot.ext = chip_anno, 
+                                       allowMultiOverlap = T, 
+                                       nthreads = n_threads)
+
+colnames(timecourse_faire_counts$counts) <- timecourse_samplesheet$Sample
+```
+
+```{r}
+faire_timecourse_dds <- DESeq2::DESeqDataSetFromMatrix(timecourse_faire_counts$counts, colData = timecourse_samplesheet, ~Time) %>% 
+  DESeq2::estimateSizeFactors(.) 
+
+faire_tc_counts <- DESeq2::counts(faire_timecourse_dds, normalized = T) 
+  
+
+# Take mean(cpm) per peak over time
+faire_tc_mat <- faire_tc_counts %>% 
+  data.frame %>% 
+  tibble::rownames_to_column("id") %>% 
+  reshape2::melt(id.vars = "id", variable.name = "Sample", value.name = c("cpm")) %>% 
+  dplyr::mutate(Sample = as.character(Sample)) %>% 
+  tidyr::separate(Sample, c("Genotype", "Time", "Rep")) %>% 
+  tidyr::unite(Sample, c("Genotype", "Time")) %>% 
+  dplyr::group_by(id, Sample) %>% 
+  dplyr::summarise(mean(cpm)) %>% 
+  dplyr::mutate(Sample = factor(Sample, levels = paste0("WT_", times))) %>% 
+  tidyr::spread(key = "Sample", value = "mean(cpm)") %>% 
+  data.frame %>% 
+  tibble::column_to_rownames("id") %>% 
+  as.matrix
+```
+
+Convert matrix to fraction of max. K-means clustering using k 2-15. Assess goodness of fit with elbow & withinss.
+```{r}
+
+fracMaxFaireMat <- faire_tc_mat %>% 
+  {. / rowMax(.)}
+
+k_list <- map(2:15, ~{
+  k <- .
+  set.seed(12341)
+  #set.seed(100)
+  kmeans(fracMaxFaireMat, centers = k)
+}) %>% 
+  set_names(2:15)
+
+k_list %>% 
+  map(., "withinss") %>% 
+  map_dbl(., max) %>% 
+  plot(2:15, ., ylab = "max withinss", xlab = "k", main = "max withinss")
+
+k_list %>% 
+  map(., "withinss") %>% 
+  map_dbl(., sum) %>% 
+  plot(2:15, ., ylab = "sum withinss", xlab = "k", main = "sum withinss")
+```
+
+```{r}
+fracMaxFaireMat_norownames <- fracMaxFaireMat
+rownames(fracMaxFaireMat_norownames) <- NULL
+```
+
+Plot all heatmaps at each K to assess clustering.
+```{r, fig.height=10, fig.width=10, eval=F}
+map(k_list[5:14], ~{ComplexHeatmap::Heatmap(fracMaxFaireMat_norownames, split = .$cluster, row_title_rot = 0, cluster_columns = F)})
+```
+
+
+### K = 8 looks pretty good.
+```{r, fig.height=10, fig.width=10}
+ComplexHeatmap::Heatmap(fracMaxFaireMat_norownames, split = k_list$`8`$cluster, row_title_rot = 0, cluster_columns = F)
+```
+
+
+
+## redo w/ k=8 with more iterations & starts
+```{r, fig.height=4.5, fig.width=7.5}
+set.seed(1230412)
+k8_redo <- kmeans(fracMaxFaireMat, 8, nstart = 25, iter.max = 15)
+
+Heatmap(fracMaxFaireMat_norownames, split = k8_redo$cluster, 
+        cluster_columns = F, 
+        row_title_rot = 0, show_row_dend = F)
+```
+
+Reordering clusters so it looks pretty
+```{r}
+k_df <- k8_redo$cluster %>% 
+  data.frame %>% 
+  dplyr::rename(k = ".") %>% 
+  tibble::rownames_to_column("id") %>% 
+  dplyr::mutate(new_k1 = dplyr::case_when(k == 1 ~ 2,
+                                          k == 2 ~ 7,
+                                          k == 3 ~ 5,
+                                          k == 4 ~ 1,
+                                          k == 5 ~ 8,
+                                          k == 6 ~ 4,
+                                          k == 7 ~ 3,
+                                          k == 8 ~ 6)) %>% 
+  dplyr::rename(old_k = k,
+                k = new_k1)
+```
+
+
+```{r, fig.height=10, fig.width=10}
+# increase spacing between clusters on heatmap
+# change colors to be colorblind friendly
+# rename legend
+# set legend to continuous values
+# relative time names for columns?
+# hide dendrogram?
+
+times_hours_lookup <- c("-6h" = "3LW", "6h" = "6APF", "18h" = "18APF", "24h" = "24APF", "36h" = "36APF", "44h" = "44APF")
+figure_col_fun <- circlize::colorRamp2(breaks = c(0,0.5,1),
+                                       colors = viridis::viridis(3))
+
+heatmap_figure_matrix <- fracMaxFaireMat_norownames
+colnames(heatmap_figure_matrix) <- names(times_hours_lookup)
+```
+
+
+```{r, fig.height=4.5, fig.width=7.5}
+figure_kmeans_heatmap <- ComplexHeatmap::Heatmap(heatmap_figure_matrix, 
+                        split = k_df$k, 
+                        cluster_columns = F, 
+                        row_title_rot = 0, 
+                        heatmap_legend_param = list(color_bar = "continuous", 
+                                                    at = c(0, 0.5, 1),
+                                                    title = "Fraction of Max\nFAIRE Signal",
+                                                    title_position = "topcenter",
+                                                    grid_height = unit(1.5, "lines")), 
+                        # Appears column title rotation is broken in this release...
+                        column_title_rot = 0, 
+                        show_row_dend = F,
+                        gap = unit(0.5, "lines"),
+                        col = figure_col_fun) 
+figure_kmeans_heatmap
+```
+
+
+```{r}
+uca_k <- k_df %>% 
+  dplyr::select(id, k) %>% 
+  dplyr::left_join(., unionChip_anno, by = "id") 
+
+```
+
+```{r}
+# Get fasta sequence of each cluster, use later for motif analysis
+uca_k_fasta <- uca_k %>% 
+  dplyr::mutate(k_name = paste0("k", k)) %>% 
+  GRanges %>% 
+  computeSummits %>% 
+  split(mcols(.)$k_name) %>% 
+  write_fasta_of_region(., resize_bp = 100, outdir = "Motif_Data/k8_motifs")
+```
+
+```{r}
+mckay_enh <- import.bed("Data/mckaylab_cloned_enhancers.bed")
+
+ov <- uca_k %>% 
+  GRanges %>% 
+  findOverlaps(., mckay_enh) 
+
+enh_k <- uca_k %>% 
+  tibble::rowid_to_column("rowid") %>% 
+  dplyr::inner_join(., data.frame(ov), by = c("rowid" = "queryHits")) %>% 
+  dplyr::mutate(name = mckay_enh$name[subjectHits]) 
+```
+
+
+
+```{r}
+wt_fracMax_data <- fracMaxFaireMat %>% 
+  data.frame %>% 
+  dplyr::mutate(k = k_df$k) %>% 
+  tibble::rownames_to_column("id") %>% 
+  reshape2::melt(id.vars = c("id", "k"), variable.name = c("sample"), value.name = "fracMax") %>% 
+  dplyr::group_by(k, sample) %>% 
+  tidyr::separate(sample, c("Genotype", "Time"), remove = F) %>% 
+  dplyr::mutate(median = median(fracMax)) %>% 
+  dplyr::mutate(low_q = quantile(fracMax)[2],
+                high_q = quantile(fracMax)[4]) 
+
+```
+
+## plot enhancers as lines in WT
+```{r}
+enhancer_ov_chip <- enh_k %>% 
+  dplyr::filter(!is.na(name)) %>% 
+  dplyr::select(name, everything())
+
+tested_enhancers <- enhancer_ov_chip %>% 
+  dplyr::filter(name %in% c("tnc_B", "tnc_A", "br_A", "nub1")) %>% 
+  dplyr::mutate(enhancer_name = case_when(name == "tnc_A" ~ "tnc-wv",
+                                          name == "tnc_B" ~ "tnc-blade",
+                                          name == "br_A" ~ "br-disc",
+                                          name == "nub1" ~ "nub-vein")) %>% 
+  dplyr::select(name, enhancer_name, id)
+
+tested_enhancers 
+```
+## plot enhancer
+```{r}
+enh_dat <- fracMaxFaireMat %>% 
+  data.frame %>% 
+  tibble::rownames_to_column(., "id") %>% 
+  dplyr::mutate(k = k_df$k) %>% 
+  reshape2::melt(id.vars = c("id", "k"), variable.name = c("sample"), value.name = "fracMax") %>% 
+  tidyr::separate(sample, c("Genotype", "Time"), remove = F) %>% 
+  dplyr::left_join(., tested_enhancers, by = "id") %>% 
+  dplyr::mutate(enhancer_name = ifelse(is.na(enhancer_name), "All", enhancer_name)) %>% 
+  dplyr::filter(enhancer_name != "All") %>% 
+  dplyr::mutate(median = fracMax) %>% 
+  dplyr::mutate(low_q = 0,
+                high_q = 0)
+
+```
+
+```{r, fig.height=6, fig.width=7.5}
+times_hours_lookup <- c("-6h" = "3LW", "6h" = "6APF", "18h" = "18APF", "24h" = "24APF", "36h" = "36APF", "44h" = "44APF")
+
+
+k_labels <- k_df %>% 
+  dplyr::group_by(k) %>% 
+  dplyr::count() %>% 
+  #tidyr::unite(k_label, c("new_k3", "n"), remove = F) %>% 
+  dplyr::mutate(k_label = paste0(k, "\n(n = ", n, ")"))
+
+enh_labels <- enh_dat %>% 
+  dplyr::filter(enhancer_name != "All",
+                Time == "44APF") %>% 
+  dplyr::mutate(Time = factor(Time, levels = times_nozero)) %>% 
+  dplyr::mutate(Time = fct_recode(Time, !!!times_hours_lookup)) %>% 
+  dplyr::mutate(y_pos = case_when(enhancer_name %in% c("tnc-blade", "br-disc") ~ 0.93,
+                                  enhancer_name == "tnc-wv" ~ 0.72,
+                                  enhancer_name == "nub-vein" ~ 0.20)) %>% 
+  dplyr::mutate(x_nudge = case_when(enhancer_name %in% c("tnc-blade", "nub-vein") ~ as.integer(Time) - 0.5,
+                                  enhancer_name == "tnc-wv" ~ as.integer(Time) - 0.3,
+                                  enhancer_name == "br-disc" ~ as.integer(Time) - 0.3)) %>% 
+  dplyr::left_join(., k_labels, by = "k")
+
+enh_dat2 <- enh_dat %>% 
+  dplyr::mutate(Time = factor(Time, levels = times_nozero)) %>% 
+  dplyr::mutate(Time = fct_recode(Time, !!!times_hours_lookup)) %>% 
+  dplyr::left_join(., k_labels, by = "k")
+  
+
+wt_fracMax_enh_lineplot_square <- wt_fracMax_data %>% 
+  dplyr::left_join(., k_labels, by = "k") %>% 
+  tidyr::separate(sample, c("Genotype", "Time"), remove = F) %>% 
+  dplyr::mutate(Time = factor(Time, levels = times_nozero)) %>% 
+  dplyr::mutate(Time = fct_recode(Time, !!!times_hours_lookup)) %>% 
+  ggplot(aes(Time, median)) +
+    geom_ribbon(aes(ymin = low_q, ymax = high_q, group = k), alpha = 1/5) +
+    geom_line(aes(group = k), size = 0.9) +
+    geom_line(data = enh_dat2 %>% dplyr::filter(enhancer_name != "All", sample != "E93GOF_3LW"), 
+              aes(x = Time, y = median, color = enhancer_name, group = interaction(k, enhancer_name), linetype = enhancer_name),
+              size = 0.7) +
+    facet_wrap(~k_label, ncol = 3) + 
+    theme_bw() +
+    theme(axis.text.x = element_text(size = 12), 
+          axis.text.y = element_text(size = 12),
+          axis.title = element_text(size = 12),
+          legend.position = "none", 
+          panel.grid = element_blank(),
+          strip.text.x = element_text(size = 12))  +
+    scale_linetype_manual(values = c("br-disc" = "solid", 
+                                     "nub-vein" = "solid",
+                                     "tnc-blade" = "solid",
+                                     "tnc-wv" = "dashed")) +
+    guides(linetype = guide_legend(override.aes = list(linetype = "solid"))) +
+    ylab("Fraction of Maximum Accessibility") +
+    xlab("Hours Relative to Puparium Formation") +
+    geom_label(data = enh_labels, 
+               aes(label = enhancer_name, 
+                   y = y_pos,
+                   fill = enhancer_name, x = x_nudge))
+```
+
+
+```{r, fig.height=6, fig.width=7.5}
+wt_fracMax_enh_lineplot_square
+```
+
+
+# 06 Review Analysis
+
+### PTMs at E93 sensitive Sites
+
+```{r}
+ss_ptm <- ptm_sampleSheet %>% 
+  dplyr::filter(Sample %in% c("H3K4m1", "H3K27Ac", "H3K27m3", "H3"))
+
+ptm_filter_e93_sens_heatmap <- unionChip_anno %>% 
+  tidyr::unite(type, c(e93_sensitive_behavior, e93_sensitive)) %>% 
+  dplyr::filter(!grepl("NA", type)) %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  #split(mcols(.)$type) %>% 
+  #get_signal_data(ptm_sampleSheet, ptm_sampleSheet$BigwigZnorm, features = ., xmax = 5000, xmin = 5000, output_type = "heatmap") 
+  get_signal_data(ss_ptm, ss_ptm$BigwigZnorm, features = ., xmax = 5000, xmin = 5000, output_type = "enrichedheatmap") 
+```
+
+### Heatmaps 
+```{r}
+new_hms <- pmap(list(ptm_filter_e93_sens_heatmap,
+                names(ptm_filter_e93_sens_heatmap),
+                list(c(0, 5),
+                     c(0, 1.5),
+                     c(0, 8),
+                     c(0, 4))),
+                ~{
+  dat <- ..1
+  name <- ..2
+  breaks <- ..3
+  
+  dat$ranges %<>%
+    dplyr::mutate(type = gsub("Static_", "", type),
+      type_split = gsub("_", "\n", type))
+  
+  colors <- circlize::colorRamp2(viridis::plasma(length(breaks)),
+                                 breaks = breaks)
+
+  EnrichedHeatmap::EnrichedHeatmap(mat = dat$matrix,
+                                   column_title = name,
+                                   #col = circlize::colorRamp2(c('blue', 'white', 'red'), breaks = ptm_breaks(name) %>% round(., 2)),
+                                   col = colors, 
+                                   axis_name = c("-5kb", "summit", "5kb"), 
+                                   axis_name_gp = gpar(fontsize = 8),
+                                   heatmap_legend_param = list(color_bar = "continuous", 
+                                                               title = glue::glue("{name} zscore"),
+                                                               title_gp = gpar(fontsize = 8),
+                                                               labels_gp = gpar(fontsize = 8)), 
+                                   pos_line = F,
+                                   split = dat$ranges$type_split,
+                                   column_title_gp = gpar(fontsize = 8),
+                                   row_title_gp = gpar(fontsize = 8),
+                                   row_title_rot = 0) 
+                                   #use_raster = T, 
+                                   #raster_quality = 5)
+                                   #raster_device = "png",
+                                   #raster_device_param = list(width = 2.7,
+                                   #                           height = 5,
+                                   #                           res = 300,
+                                   #                           units = "in"))
+  
+})
+```
+
+Note: issue is that setting use_raster = T causes a horizontal line to form on the insensitive peaks
+```{r, fig.height=5, fig.width=2.7}
+k27ac_heatmap <- grid.grabExpr(EnrichedHeatmap::draw(new_hms$H3K27Ac))
+k4m1_heatmap <- grid.grabExpr(EnrichedHeatmap::draw(new_hms$H3K4m1))
+```
+
+```{r, fig.height=5, fig.width=5.4}
+ptm_heatmap_fig <- cowplot::plot_grid(k27ac_heatmap, k4m1_heatmap, 
+                   nrow = 1, 
+                   labels = c("B", "C"),
+                   label_size = 12,
+                   label_fontfamily = "Arial",
+                   label_fontface = "bold"
+                  )
+```
+
+## PTM E93 Sensitive
+
+```{r}
+ptm_e93_sens_avSig <- unionChip_anno %>% 
+  tidyr::unite(type, c(e93_sensitive_behavior, e93_sensitive)) %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  split(mcols(.)$type) %>% 
+  get_signal_data(ptm_sampleSheet, ptm_sampleSheet$BigwigZnorm, features = ., 
+                  xmax = 5000, 
+                  xmin = 5000) 
+```
+
+```{r, fig.height=10, fig.width=10}
+ptm_e93_sens_avSig %>% 
+  #tidyr::separate(desc, c("e93_dep", "e93_sens", "e93_sens_behavior")) %>% 
+  dplyr::mutate(type = gsub("_", "\n", desc)) %>% 
+  dplyr::filter(!grepl("NA", type)) %>% 
+  dplyr::mutate(type = fct_relevel(type, c("Decreasing\nsensitive",
+                                     "Static\ninsensitive"))) %>% 
+  ggplot(aes(position, mean)) +
+    geom_line() +
+    facet_grid(Sample~type, scales = "free_y") +
+    labs(x = NULL,
+         y = "ChIP Signal (Z-Score)") +
+    theme_cowplot() +
+    theme(panel.grid.major = element_line(color = "grey92"),
+          panel.grid.minor = element_line(color = "grey92"),
+          strip.background = element_rect(fill = "grey80",
+                                          size = 0,
+                                          color = "grey50"), 
+          panel.spacing.x = unit(1, "lines")
+          ) +
+    scale_x_continuous(breaks = c(-5000, 0, 5000),
+                       labels = c(-5000, "summit", 5000))
+```
+
+### H3 Normalization
+
+```{r, fig.height=10, fig.width=10}
+h3_signal <- ptm_e93_sens_avSig %>% 
+  dplyr::filter(Sample ==  "H3") %>% 
+  dplyr::select(position, mean, desc) %>% 
+  dplyr::rename(h3_signal = mean) %>% 
+  dplyr::mutate(id = position %>% as.factor()) %>% 
+  dplyr::select(-position)
+
+h3_norm_avsig <- ptm_e93_sens_avSig %>% 
+  dplyr::mutate(id = position %>% as.factor()) %>% 
+  dplyr::left_join(., h3_signal, by = c("id" = "id", 
+                                        "desc" = "desc")) %>% 
+  dplyr::mutate(sub_signal = mean - h3_signal,
+                div_signal = mean / h3_signal) 
+```
+
+
+
+
+```{r, fig.height=4, fig.width=4.12}
+ptm_h3norm <- h3_norm_avsig %>% 
+  dplyr::filter(!grepl("H3K79", Sample)) %>% 
+  dplyr::mutate(type = gsub("Static_i", "I", desc)) %>% 
+  dplyr::mutate(type = gsub("_", "\n", type)) %>% 
+  dplyr::filter(!grepl("NA", type)) %>% 
+  dplyr::mutate(type = fct_relevel(type, c("Decreasing\nsensitive",
+                                     "Insensitive"))) %>% 
+  ggplot(aes(position, sub_signal)) +
+    geom_line() +
+    facet_grid(Sample~type, scales = "free_y") +
+    labs(x = NULL,
+         y = "ChIP Signal (Relative to Total H3)") +
+    theme_cowplot() +
+    theme(panel.grid.major = element_line(color = "grey92"),
+          panel.grid.minor = element_line(color = "grey92"),
+          strip.background = element_rect(fill = "grey80",
+                                          size = 0,
+                                          color = "grey50"), 
+          panel.spacing.x = unit(.9, "lines"),
+          strip.text = element_text(size = 8),
+          axis.text = element_text(size = 8),
+          axis.title = element_text(size = 8), 
+          plot.tag = element_text(size = 12)
+          ) +
+    theme_development +
+    scale_x_continuous(breaks = c(-5000, 0, 5000),
+                       labels = c("-5 kb", "summit", "5 kb")) 
+  
+  
+ptm_h3norm
+```
+# S6
+```{r, fig.height=4.2, fig.width=9.62}
+W <- 9.62
+H <- 4.2
+# hxw
+# 4x4.12
+cowplot::plot_grid(
+  ptm_h3norm,
+  ptm_heatmap_fig,
+  nrow = 1,
+  rel_widths = c(4.12/W, 5.5/W),
+  labels = c("A", ""),
+  label_size = 12, 
+  label_fontfamily = "Arial"
+)
+```
+
+
+# PWM Similarity of FIMO matched motifs
+### PWM within Ectopic/Entopic/Orphan
+Use FIMO output to regenerate PWMs from each matched sequence
+
+```{r, message=F}
+dm3.genome <- BSgenome.Dmelanogaster.UCSC.dm3::BSgenome.Dmelanogaster.UCSC.dm3
+flyFactorMotifs <- importMatrix("/DATA/FlyFactorMotifs/fly_factor_survey.meme")
+```
+
+```{r}
+########### PWM From categories
+
+pwm_by_category <- function(motifs,
+                            plotType = "all", 
+                            ref_peaks = unionChip_anno,
+                            ref_pwm = flyFactorMotifs$FBgn0013948.Eip93F_SANGER_10@mat, 
+                            ref_name = "E93 Fly Factor", ncol = 1, dropNegs = F, plot = T, ...){
+  
+  ov <- findOverlaps(GRanges(ref_peaks), GRanges(motifs))
+  
+  fimo_bytype <- e93_core_fimo[subjectHits(ov),] %>% 
+    dplyr::mutate(type = ref_peaks[queryHits(ov),]$peak_binding_description) %>% 
+    dplyr::mutate(type = gsub("_endogenous", "", type)) %>% 
+    dplyr::mutate(chip_id = ref_peaks[queryHits(ov),]$id) %>% 
+    dplyr::mutate(wt_l3_24_dynamic_behavior = ref_peaks[queryHits(ov),]$wt_l3_24_dynamic_behavior) 
+  
+  all_seq <- fimo_bytype %>% 
+    split(.$type) %>% 
+    map(., GRanges) %>% 
+    map(., ~{getSeq(dm3.genome, .x)}) 
+
+  best_seq <- fimo_bytype %>% 
+    dplyr::group_by(chip_id) %>% 
+    dplyr::filter(p.value == min(p.value)) %>% 
+    split(.$type) %>% 
+    map(., GRanges) %>% 
+    map(., ~{getSeq(dm3.genome, .x)})
+    
+  
+  toPlot <- switch(plotType,
+                   best = best_seq,
+                   all = all_seq)
+  
+  title <- switch(plotType, 
+                  best = "Best Match",
+                  all = "All Matches")
+  
+  dropNeg_pwm <- function(pwm){
+    pwm[pwm < 0] = 0
+    return(pwm)
+  }
+  
+  if (plot == T){
+    map(toPlot, PWM) %>% 
+      {.[[ref_name]] <- ref_pwm
+      return(.)} %>% {
+        pwms <- .
+        if (dropNegs == T){
+          return(map(pwms, dropNeg_pwm))
+        } else {
+          return(pwms)
+        }
+      } %>% 
+      ggseqlogo::ggseqlogo(ncol = ncol, ...) +
+        ggtitle(title)
+    
+  } else {
+    # Return sequences instea of plot
+    return(toPlot) 
+  }
+  
+ 
+}
+```
+
+```{r}
+uca_20bp_summits <- unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits %>% 
+  resize(20, "center")
+```
+
+Functions for performing motif similarity calculation & interconversion
+```{r}
+add_universalMotif_background <- function(motif){
+  motif@bkg <- c(0.25, 0.25, 0.25, 0.25)
+  return(motif)
+}
+
+universalmotif_to_tfbstools_pwm <- function(universalmotif){
+  # Convert PWM to universal motif, manually add background freq because using old version
+  # Then return PWM in TFBSTools format
+  universalmotif %>% 
+    universalmotif::convert_motifs() %>% 
+    add_universalMotif_background() %>% 
+    universalmotif::convert_motifs(out_class = "TFBSTools-PFMatrix") %>% 
+    TFBSTools::toPWM()
+}
+
+make_biostring_pwm_noneg <- function(seq){
+  # 
+  pwm <- Biostrings::PWM(seq) 
+  
+  # Get PWM (drop negative positions)
+  pwm[pwm < 0] = 0
+ 
+  # PWMEnrich data structure encodes PFM & PWM information 
+  PWMEnrich::toPWM(pwm)
+}
+
+get_pfm <- function(pwm){
+  testthat::expect_s4_class(pwm, "PWM")
+  pwm@pfm
+}
+
+PWMPearson <-  function(pwm1, pwm2){
+  # Modified from TFBSTools source code
+  # input can now be any matrix (PFM or PWM)
+  #
+  # now the pwm1 and pwm2 must have the same widths
+  stopifnot(isConstant(c(ncol(pwm1), ncol(pwm2))))
+  top = colSums((pwm1 - 0.25) * (pwm2 - 0.25))
+  bottom = sqrt(colSums((pwm1 - 0.25)^2) * colSums((pwm2 - 0.25)^2))
+  r = 1 / ncol(pwm1) * sum((top / bottom))
+  return(r)
+}
+
+add_e93_pfm <- function(pfm_list){
+  # takes list of pfms and adds E93 fly factor survey motif as PFM
+  pfm_list$`E93 FlyFactor` <- flyFactorMotifs$FBgn0013948.Eip93F_SANGER_10@mat %>% 
+    PWMEnrich::toPWM() %>% 
+    .@pfm
+  return(pfm_list)
+}
+
+pfm_cor_mat <- function(pfm_list){
+  # Takes list of pfms and returns pearson correlation matrix
+  corMat <- map_dfr(pfm_list, ~{
+    pfm <- .x
+    map_dfc(pfm_list, PWMPearson, pfm)
+  }, .id = "id") %>% 
+    tibble::column_to_rownames("id") %>% 
+    as.matrix()
+}
+```
+
+Generate pfms for each category match, perform pearson corrlation
+```{r}
+
+pfm_by_category <- map(list("best" = "best", 
+                            "all" = "all"), ~{
+  pfms <- pwm_by_category(e93_core_fimo, .x, ref_peaks = uca_20bp_summits, ncol = 2, method = "bits", 
+                                        dropNegs = T, plot = F) %>% 
+          map(., make_biostring_pwm_noneg) %>% 
+          map(., get_pfm) %>% 
+          add_e93_pfm()
+  
+  cor <- pfm_cor_mat(pfms)
+  
+  return(list("pfms" = pfms,
+              "cor" = cor))
+}) %>% 
+  transpose()
+
+```
+
+```{r}
+# Function for heatmap plot of pearson cor
+motif_pearson_heatmap <- function(corMat, append = ""){
+  
+  if (append != "") {
+    title <- glue::glue("Motif Similarity ({append})")
+  } else {
+    title <- "Motif Similarity"
+  }
+           
+           
+  
+  ComplexHeatmap::Heatmap(corMat, 
+    col = circlize::colorRamp2(c(0.60, 1), c("white", "dodgerblue3")),
+    name = "Pearson's R", 
+    heatmap_legend_param = list(color_bar = "continuous"),
+    column_title = title
+    )
+}
+
+motif_pearson_heatmap_development <- function(corMat, append = ""){
+  
+  if (append != "") {
+    title <- glue::glue("Motif Similarity ({append})")
+  } else {
+    title <- "Motif Similarity"
+  }
+           
+           
+  
+  ComplexHeatmap::Heatmap(corMat, 
+    col = circlize::colorRamp2(c(0.60, 1), c("white", "dodgerblue3")),
+    name = "Pearson's R", 
+    heatmap_legend_param = list(color_bar = "continuous", 
+                                labels_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+                                title_gp = gpar(fontsize = 8, fontfamily = "Arial")
+                                ),
+    column_names_gp = gpar(fontsize = 8, fontfamily = "Arial"),
+    row_names_gp = gpar(fontsize = 8, fontfamily = "Arial"), 
+    column_title_gp = gpar(fontsize = 8, fontfamily = "Arial"), 
+    column_dend_height = unit(1, "lines"),
+    row_dend_width = unit(1, "lines"),
+    column_title = title
+    )
+}
+```
+
+```{r, fig.height=5, fig.width=6}
+(pfm_pearson_heatmaps <- imap(pfm_by_category$cor, motif_pearson_heatmap))
+```
+
+
+```{r, fig.height=5, fig.width=10}
+(pfm_logo_matches <- imap(pfm_by_category$pfms, ~{
+  ggseqlogo::ggseqlogo(.x) +
+    ggtitle(glue::glue("{type} Matches", type = Hmisc::capitalize(.y))) +
+    theme(plot.title = element_text(hjust = 0.5, size = 48 / .pt),
+          strip.text = element_text(size = 42 / .pt))
+}))
+```
+
+
+## Centrality
+```{r}
+motif_dist_from_summit <- unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  distanceToNearest(., GRanges(e93_core_fimo))
+```
+
+
+```{r, fig.height=4, fig.width=5}
+summit_motif_cumdist <- function(color){
+  #color <- enquo(color)
+  unionChip_anno %>% 
+    #dplyr::mutate(e93_dependent_behavior = glue::glue("{e93_dependent}_{wt_l3_24_dynamic_behavior}")) %>% 
+    dplyr::mutate(e93_motif_dist_from_summit = mcols(motif_dist_from_summit)$distance) %>% 
+    toOrphan() %>% 
+    ggplot(aes(e93_motif_dist_from_summit)) +
+      stat_ecdf(aes_string(color = color), pad = F) +
+      theme_cowplot() +
+      theme(legend.position = c(0.4, 0.5))
+  
+}
+
+summit_cumdist_plots <- map(
+  c("peak_binding_description",
+      "wt_l3_24_dynamic_behavior",
+      "e93_response_category",
+      "e93_sensitive",
+      "e93_dependent",
+      "e93_sensitive_behavior"), 
+      summit_motif_cumdist)
+
+summit_cumdist_plots[1]
+```
+
+```{r, fig.height=4, fig.width=5}
+cols <- binding_colors
+names(cols) <- gsub("_endogenous", "", names(binding_colors))
+summit_cumdist_plots[[1]] +
+  scale_color_manual(values = cols) +
+  labs(x = "E93 motif distance from summit (bp)",
+       y = "Fraction of Sites",
+       color = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 1)))
+```
+
+KS test for differences in centrality relative to entopic sites.
+
+```{r}
+unionChip_anno %>% 
+  dplyr::mutate(e93_motif_dist_from_summit = mcols(motif_dist_from_summit)$distance) %>% 
+  toOrphan() %>% 
+  data.frame %>% 
+  split(.$peak_binding_description) -> x
+
+ks.test(x$entopic$e93_motif_dist_from_summit, x$orphan$e93_motif_dist_from_summit)
+ks.test(x$entopic$e93_motif_dist_from_summit, x$ectopic$e93_motif_dist_from_summit)
+```
+
+# Fig S4
+
+```{r, fig.height=2.5, fig.width=2.5}
+cols <- binding_colors
+names(cols) <- gsub("_endogenous", "", names(binding_colors))
+
+(s4_motifCumdist <- summit_cumdist_plots[[1]] +
+  scale_color_manual(values = cols) +
+  labs(x = "E93 motif distance from summit (bp)",
+       y = "Fraction of Sites",
+       color = NULL) +
+  guides(color = guide_legend(override.aes = list(size = 1),
+                              keyheight = unit(0.01, "lines"), 
+                              label.theme = element_text(size = 8, family = "Arial"))) +
+    annotate("text", x = 25, y = .95, label = "n.s.", fontface = "plain") +
+  theme_development)
+```
+
+```{r, fig.height=2.5, fig.width=5}
+(s4_pfm_logo_matches <- imap(pfm_by_category$pfms, ~{
+  ggseqlogo::ggseqlogo(.x) +
+    theme_development
+}))
+```
+
+```{r, fig.height=2.5, fig.width=3}
+(pfm_pearson_heatmaps_development <- map(pfm_by_category$cor, motif_pearson_heatmap_development))
+
+s4_heatmaps <- map(pfm_pearson_heatmaps_development, ~{
+  grid.grabExpr(ComplexHeatmap::draw(.x))
+})
+```
+
+```{r, fig.height=5, fig.width=5.5}
+W <- 5.5
+s4_top <- cowplot::plot_grid(s4_motifCumdist, 
+                             s4_heatmaps$all,
+                             labels = c("A", "C"),
+                             label_size = 12,
+                             label_fontfamily = "Arial",
+                             label_fontface = "bold",
+                             rel_widths = c(2.5/W, 3/W),
+                             nrow = 1)
+cowplot::plot_grid(
+  s4_top,
+  s4_pfm_logo_matches$all,
+  ncol = 1,
+  labels = c("", "B"), 
+  label_size = 12, 
+  label_fontfamily = "Arial",
+  label_fontface = "bold")
+
+```
+
+
+
+
+
+
+## Similarity of HOX TF motifs
+For my own sanity, I want to confirm in my own hands that saying the "AATWAA" motif in orphan sites matches lots of hox TFs.
+
+Here I generate a correlation matrix for all *Drosophila* hox TFs and ask where
+the *denovo* motif clusters. This takes a long time, so I have cached the data
+in `Data/hox_tf_corMat.rda`. Indeed, the AATWAA motif has very high correlation
+value with many other Hox TFs, due to the relative similarity of Hox motifs (see
+work from Richard Mann).
+```{r}
+MotifDb::query(MotifDb::MotifDb, 'FlyFactorSurvey') %>% 
+  MotifDb::query('homeobox') -> hox_flyFactor
+```
+
+```{r, eval=F}
+hox_tf_corMat <- pwme_pfm_cor_mat(map(hox_flyFactor@listData, PWMEnrich::toPWM))
+save(hox_tf_corMat, file = "Data/hox_tf_corMat.rda")
+```
+
+```{r, fig.height=20, fig.width=20}
+load(file = "Data/hox_tf_corMat.rda")
+
+colnames(hox_tf_corMat) %<>% 
+  gsub("Dmelanogaster-FlyFactorSurvey-", "", .) %>% 
+  gsub("_.+", "", .)
+
+rownames(hox_tf_corMat) %<>% 
+  gsub("Dmelanogaster-FlyFactorSurvey-", "", .) %>% 
+  gsub("_.+", "", .)
+
+```
+This also takes a long time to run, so cached result. Swap this chunk to `eval=T` to rerun.
+```{r, eval=F}
+fix_motifdbNames <- function(x){
+  gsub("Dmelanogaster-FlyFactorSurvey-", "", x) %>% 
+  gsub("_FBgn.+", "", .)
+}
+
+hox_tf_list_w_orphan <- hox_flyFactor@listData %>% 
+  purrr::set_names(fix_motifdbNames) %>% 
+  {
+    dat <- .
+    
+    dat[["orphan_AATWAA"]] <- chip_category_seq_narrow.v.shuffle_dreme$orphan_endogenous$motifs$AATWAA@mat %>% 
+      motifStack::pfm2pwm()
+    
+    return(dat)
+  }
+
+
+hox_tf_corMat_orphan <- pwme_pfm_cor_mat(map(hox_tf_list_w_orphan, PWMEnrich::toPWM))
+save(hox_tf_corMat_orphan, file = "Data/hox_tf_corMat_orphan-AATWAA.rda")
+```
+```{r, fig.height=23, fig.width=23}
+load("Data/hox_tf_corMat_orphan-AATWAA.rda")
+anno <- hox_tf_corMat_orphan %>% 
+  rownames() %>% 
+  data.frame("id" = .) %>% 
+  dplyr::mutate(type = grepl("orphan", id),
+                type = case_when(type == T ~ "Orphan",
+                                 type == F ~ "Hox")) %>% 
+  tibble::column_to_rownames("id") %>% 
+  data.frame
+
+anno_colors = list(
+  type = c("Hox" = "grey",
+           "Orphan" = "firebrick")
+)
+
+pheatmap::pheatmap(hox_tf_corMat_orphan, 
+                   col = colorRampPalette(c("white", "dodgerblue4"))(255),
+                   annotation_colors = anno_colors,
+                   annotation_row = anno,
+                   annotation_col = anno)
+```
+
+Quick check that these motifs are clustering by real differences, not assay specific differences.
+
+Databases appear well interspersed with eachother in heatmap (here as 'db' annotation)
+```{r, fig.height=23, fig.width=23}
+anno <- hox_tf_corMat_orphan %>% 
+  rownames() %>% 
+  data.frame("id" = .) %>% 
+  tidyr::separate(id, c("tf", "db"), sep = "_", remove = F) %>% 
+  tibble::column_to_rownames("id") %>% 
+  data.frame
+
+pheatmap::pheatmap(hox_tf_corMat_orphan, 
+                   col = colorRampPalette(c("white", "dodgerblue4"))(255),
+                   annotation_row = anno,
+                   annotation_col = anno)
+```
+
+# AME motif matching
+
+```{r}
+ame_bindDescription <- unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  resize(width = 200, fix = "center") %>% {
+    all <- .
+    
+    by_category <- all %>% 
+      split(mcols(.)$peak_binding_description)
+    
+    by_category_all <- by_category
+    by_category_all$all <- all
+    
+    all_fa <- write_fasta_of_region(GRangesList(all = all), "Motif_Data/e93_binding_description_ame", resize_bp = 0)
+    fa <- write_fasta_of_region(by_category, "Motif_Data/e93_binding_description_ame", resize_bp = 0)
+    
+    #out <- map(fa, ~{runAme(input = ., control = all_fa)})
+    
+    return(list(fa = fa, 
+                all = all_fa))
+  }
+
+
+ame_res <- map(ame_bindDescription$fa, ~{
+  runAmev5(input = .x, 
+           control = ame_bindDescription$all$all, meme_path = "~/meme_5.1.0/")
+})
+
+```
+
+```{r}
+
+ame_res_df <- ame_res %>% 
+  transpose %>% 
+  {map_dfr(.$tsv, readr::read_tsv, comment = "#", .id = "type")} %>% 
+  dplyr::rename_all(function(x){gsub("-", ".", x)})
+
+```
+```{r}
+ame_get_tfid <- function(res){
+  res %>% 
+    dplyr::mutate(tfid = stringr::str_split_fixed(motif_ID, "_", 2) %>% .[,1]) 
+}
+
+
+ame_get_best_tfid <- function(ame){
+  # get TfId with lowest p-value by group
+  testthat::expect_true(c("tfid") %in% names(ame), 
+                        info = "run ame_get_tfid() before this function to make tfid column")
+  ame %>% 
+    dplyr::group_by(tfid, type) %>% 
+    dplyr::filter(adj_p.value == min(adj_p.value)) %>% 
+    dplyr::ungroup()
+  
+}
+
+ame_order_by_cluster <- function(ame){
+  # orders data in "order" column first by TFs unique to each type, 
+  # then by motifs shared between types such that tfs are shown by unique, pairwise, 3-wise, etc.
+  # starting from the first type upwards.
+  
+  # consider a factor: F with 3 levels (j), and 6 rows (i)
+  # for a heatmap of the following:
+  #
+  # i6 | .   2   3
+  # i5 | 1   .   3
+  # i4 | 1   2   .
+  # i3 | .   .   3
+  # i2 | .   2   .
+  # i1 | 1   .   .
+  #    |___________
+  #      j1  j2  j3
+  #
+  # We can compute the rank 
+  # by counting the number of entries for each i (ex i1 = 1, i5 = 2)
+  # we can rank order by j-pairwise clusters by ranking by 
+  # count(F), min(F), max(F) in that order. 
+  # (ex i4 = c(2,1,2), while i5 = c(2,1,3))
+  # 
+  # where F is implemented below as type_rank
+  
+  ame %>% 
+    dplyr::mutate(type = factor(type),
+                  type_rank = as.integer(type)) %>% 
+    dplyr::group_by(tfid) %>% 
+    dplyr::mutate(nType = n(),
+                  minType = min(type_rank),
+                  maxType = max(type_rank)) %>% 
+    dplyr::ungroup() %>% 
+    dplyr::arrange(nType, minType, maxType) %>% 
+    tibble::rowid_to_column("order")
+  
+}
+
+ame_plot_ordered_heatmap <- function(ame){
+  ame %>% 
+    ame_get_tfid() %>% 
+    ame_get_best_tfid() %>% 
+    ame_order_by_cluster() %>% 
+    ggplot(aes(reorder(tfid, order), type)) +
+      geom_tile(aes(fill = -log10(adj_p.value)), color = 'black', size = 0.3) +
+      theme_bw() +
+      theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+            axis.text = element_text(color = "black",
+                                     size = 34 / .pt)) +
+      labs(x = NULL,
+           y = NULL,
+           fill = "-log10(p.adj)") +
+      scale_fill_gradient2(low = "white",
+                           high = "firebrick")
+    
+}
+
+
+```
+
+
+```{r, fig.width=10, fig.height=3}
+ame_res_df %>% 
+  ame_get_tfid() %>% 
+  toOrphan(type) %>% 
+  dplyr::filter(rank %in% 1:25) %>% 
+  ame_plot_ordered_heatmap() +
+    ggtitle("AME vs All ChIP (Top 25)")
+```
+
+# Distribution of binding categories
+```{r, fig.height=3, fig.width=7.5}
+unionChip_anno %>% 
+  ggplot(aes(factor("All E93 ChIP Peaks"))) +
+    geom_bar(aes(fill = anno_simple), position = "fill") +
+    coord_flip() +
+    labs(x = NULL,
+         y = "Fraction of Sites",
+         fill = "Annotation") + 
+    theme(legend.position = "bottom",
+          axis.text = element_text(size = 42 / .pt)) 
+```
+
+```{r, fig.height=5, fig.width=5}
+unionChip_anno %>% 
+  dplyr::mutate(peak_binding_description = gsub("_endogenous", "", peak_binding_description)) %>% 
+  #dplyr::mutate(anno_simple = case_when(anno_simple == "Downstream" ~ "Distal Intergenic",
+  #                                      grepl("UTR", anno_simple) ~ "Exon",
+  #                                      T ~ anno_simple)) %>% 
+  ggplot(aes(peak_binding_description)) +
+    geom_bar(aes(fill = anno_simple), position = "fill") +
+    #geom_bar(data = unionChip_anno %>% 
+    #                dplyr::mutate(anno_simple = case_when(anno_simple == "Downstream" ~ "Distal Intergenic",
+    #                                                      grepl("UTR", anno_simple) ~ "Exon",
+    #                                                      T ~ anno_simple)),
+    #         aes(x = factor("dm3"), fill = anno_simple), position = "fill"
+    #           ) +
+    coord_flip() +
+    labs(x = NULL,
+         y = "Fraction of Sites",
+         fill = "Annotation") +
+    theme(legend.position = "bottom") 
+```
+
+
+
+
+# Chromatin Accessibility of binding categories
+
+
+```{r, fig.width=7.5, fig.height=3}
+get_density <- function(x, y, ...) {
+  # https://slowkow.com/notes/ggplot2-color-by-density/
+  dens <- MASS::kde2d(x, y, ...)
+  ix <- findInterval(x, dens$x)
+  iy <- findInterval(y, dens$y)
+  ii <- cbind(ix, iy)
+  return(dens$z[ii])
+}
+
+cor_anno_df <- unionChip_anno %>% 
+  toOrphan() %>% 
+  dplyr::group_by(peak_binding_description) %>% 
+  dplyr::summarize(cor = cor(timecourse_OR.3LW_faire_signal,
+                             timecourse_OR.24APF_faire_signal)) %>% 
+  dplyr::mutate(rsq = cor^2,
+                text = glue::glue("Pearson's R = {cor_round}", cor_round = round(cor, 2)))
+
+unionChip_anno %>% 
+  toOrphan() %>% 
+  dplyr::group_by(peak_binding_description) %>% 
+  dplyr::mutate(kde = get_density(timecourse_OR.3LW_faire_signal,
+                                  timecourse_OR.24APF_faire_signal, 
+                                  n = 100)) %>% 
+  ggplot(aes(timecourse_OR.3LW_faire_signal, timecourse_OR.24APF_faire_signal)) +
+    geom_point(aes(color = kde), size = 0.8) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 1/2) +
+    facet_wrap(~peak_binding_description) +
+    geom_text(data = cor_anno_df, x = 5, y = 12.5, aes(label = text)) +
+    labs(x = "WT 3LW FAIRE\n(Z-Score)",
+         y = "WT 24APF FAIRE\n(Z-Score)",
+         color = "Density") +
+    theme_bw() +
+    scale_color_viridis_c() +
+    #coord_cartesian(xlim = c(-1,12),
+    #                ylim = c(-1,12)) +
+    coord_fixed(xlim = c(-1,15),
+                ylim = c(-1,15))
+
+```
+
+
+```{r, fig.height=3, fig.width=6}
+unionChip_anno %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  split(mcols(.)$peak_binding_description) %>% 
+  {
+    peaks <- .
+    
+    wt.only.faire <- peakTable %>% 
+      dplyr::filter(Genotype == "OR",
+                    Time %in% c("3LW", "24APF"))
+    
+    get_signal_data(wt.only.faire, wt.only.faire$BigwigZnorm, peaks)
+  } -> x
+
+(peakCategory_faire_avsig <- x %>% 
+  toOrphan(desc) %>% 
+  dplyr::mutate(Sample = gsub("OR\\.", "Wild-Type\n", Sample) %>% 
+                  gsub("\\.Wing", " FAIRE", .) %>% 
+                  gsub("APF", "h APF", .)) %>% 
+  ggplot(aes(position, mean)) +
+    geom_line(aes(color = desc), size = 1) +
+    facet_wrap(~fct_rev(Sample), scales = "free_y")  +
+    scale_color_manual(values = binding_colors_faire) +
+    guides(color = guide_legend(override.aes = list(size = 1))) +
+    ylim(0, 4.5) +
+    scale_x_continuous(labels = c(-1000, "summit", 1000),
+                       breaks = c(-1000, 0, 1000)) +
+    labs(color = NULL, 
+         y = "FAIRE Z-Score",
+         x = NULL) +
+    theme(strip.background.x = element_blank(),
+          #legend.position = c(0.82, 0.8)) 
+          #legend.position = c(0.28, 0.8)) 
+          legend.position = c(0.0001, 0.8)))
+```
+
+```{r}
+chrToKeep <- c("X", "2L", "2R", "3L", "3R", "4") %>% 
+  paste0("chr", .)
+
+dm3.granges <- GRangesForBSGenome('dm3') 
+
+# filter mapped regions (noYUHet)
+# split into 100bp bins
+# annotate features w/ chipseeker identically to how chippeaks were annotated
+
+dm3.anno <- dm3.granges %>% 
+  .[seqnames(.) %in% chrToKeep] %>% 
+  seqlengths(.) %>% 
+  GenomicRanges::tileGenome(., tilewidth = 10, cut.last.tile.in.chrom = T) %>% 
+  ChIPseeker::annotatePeak(., tssRegion = c(-500,500), TxDb = dm3.txdb, level = "gene") %>% 
+  ChIPseeker::as.GRanges(.) %>% 
+  data.frame %>% 
+  dplyr::mutate(anno_simple = gsub(" \\(.+$", "", annotation)) %>% 
+  dplyr::group_by(anno_simple) %>% 
+  dplyr::count() %>% 
+  dplyr::ungroup()
+
+```
+
+```{r, fig.height=2, fig.width=5}
+dm3.anno_bar <- dm3.anno %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(frac = n/sum(n)) %>%  
+  ggplot(aes(factor('dm3'), frac)) +
+    geom_col(aes(fill = anno_simple), position = "stack") +
+    coord_flip() +
+    theme_grey()
+
+dm3.anno_bar +
+  guides(fill = F) +
+  labs(x = NULL,
+       y = "Fraction of Sites")
+```
+
+
+```{r, fig.height=5, fig.width=6}
+unionChip_anno %>% 
+  dplyr::mutate(peak_binding_description = gsub("_endogenous", "", peak_binding_description)) %>% 
+  ggplot(aes(peak_binding_description)) +
+    geom_bar(aes(fill = anno_simple), position = "fill") +
+    geom_bar(data = unionChip_anno %>% 
+               dplyr::mutate(peak_binding_description = "All E93 ChIP Peaks"),
+             aes(fill = anno_simple), 
+             position = "fill") +
+    geom_col(data = dm3.anno %>% 
+               dplyr::ungroup() %>% 
+               dplyr::mutate(frac = n/sum(n), peak_binding_description = "dm3"), 
+             aes(fill = anno_simple, y = frac)) +
+    coord_flip(ylim = c(0.046,1)) +
+    labs(x = NULL,
+         y = "Fraction of Sites",
+         fill = "Annotation") +
+    theme(legend.position = "bottom",
+          axis.text = element_text(size = 42 / .pt),
+          axis.ticks.y = element_blank()) +
+    guides(fill = guide_legend(nrow = 4))
+```
+
+```{r, fig.height=5, fig.width=6}
+(peakCategory_annoBarplot <- unionChip_anno %>% 
+  dplyr::mutate(peak_binding_description = gsub("_endogenous", "", peak_binding_description)) %>% 
+  dplyr::mutate(anno_simple = case_when(anno_simple == "Downstream" ~ "Distal Intergenic",
+                                        grepl("UTR", anno_simple) ~ "Exon",
+                                        T ~ anno_simple)) %>% 
+  ggplot(aes(peak_binding_description)) +
+    geom_bar(aes(fill = anno_simple), position = "fill") +
+    geom_bar(data = unionChip_anno %>% 
+               dplyr::mutate(peak_binding_description = "All E93 ChIP Peaks") %>% 
+               dplyr::mutate(anno_simple = case_when(anno_simple == "Downstream" ~ "Distal Intergenic",
+                                                     grepl("UTR", anno_simple) ~ "Exon",
+                                                     T ~ anno_simple)),
+             aes(fill = anno_simple), 
+             position = "fill") +
+    geom_col(data = dm3.anno %>% 
+               dplyr::mutate(peak_binding_description = "All E93 ChIP Peaks") %>% 
+               dplyr::mutate(anno_simple = case_when(anno_simple == "Downstream" ~ "Distal Intergenic",
+                                                     grepl("UTR", anno_simple) ~ "Exon",
+                                                     T ~ anno_simple)) %>% 
+               dplyr::group_by(anno_simple) %>% 
+               dplyr::summarise(n = sum(n)) %>% 
+               dplyr::ungroup() %>% 
+               dplyr::mutate(frac = n/sum(n), peak_binding_description = "dm3"), 
+             aes(fill = anno_simple, y = frac)) +
+    coord_flip(ylim = c(0.046,1)) +
+    labs(x = NULL,
+         y = "Fraction of Sites",
+         fill = "Annotation") +
+    theme_cowplot() +
+    theme(legend.position = "bottom",
+          axis.text = element_text(size = 42 / .pt),
+          axis.ticks.y = element_blank()) +
+    guides(fill = guide_legend(nrow = 2)) +
+    scale_fill_brewer(palette = "Dark2"))
+```
+
+
+
+# Figure S3
+
+```{r}
+pt_to_mm <- function(pt){
+  pt * 0.352778
+}
+```
+
+```{r, fig.height=2.5, fig.width=6.25}
+(cor_peakCategory_scatterplot <- unionChip_anno %>% 
+  #dplyr::filter(peak_binding_description != "entopic") %>% 
+  toOrphan() %>% 
+  dplyr::group_by(peak_binding_description) %>% 
+  dplyr::mutate(kde = get_density(timecourse_OR.3LW_faire_signal,
+                                  timecourse_OR.24APF_faire_signal, 
+                                  n = 100)) %>% 
+  ggplot(aes(timecourse_OR.3LW_faire_signal, timecourse_OR.24APF_faire_signal)) +
+    geom_point(aes(color = kde), size = 0.8) +
+    geom_abline(intercept = 0, slope = 1, linetype = "dashed", alpha = 1/2) +
+    facet_wrap(~peak_binding_description) +
+    geom_text(data = cor_anno_df, x = 5, y = 12.5, aes(label = text), size = pt_to_mm(8)) +
+    labs(x = "WT 3LW FAIRE\n(Z-Score)",
+         y = "WT 24APF FAIRE\n(Z-Score)",
+         color = "Density") +
+    theme_bw() +
+    theme_development + 
+    scale_color_viridis_c() +
+    #coord_cartesian(xlim = c(-1,12),
+    #                ylim = c(-1,12)) +
+    coord_fixed(xlim = c(-1,15),
+                ylim = c(-1,15)))
+```
+
+```{r, fig.height=3, fig.width=4}
+(s3_avsig <- cowplot::plot_grid(
+  peakCategory_faire_avsig + 
+    theme_development +
+    guides(color = guide_legend(keyheight = unit(0.01, "lines"), 
+                                label.theme = element_text(size = 8, 
+                                                           family = "Arial"))),
+  NULL,
+  rel_heights = c(2/3, 1/3),
+  ncol = 1
+))
+```
+
+```{r, fig.height=3, fig.width=3}
+(s3_anno <- peakCategory_annoBarplot +
+  theme_development +
+  theme(legend.position = "bottom") +
+  guides(fill = guide_legend(title.position = "top",
+                             title.hjust = 0.5,
+                             ncol = 2)))
+```
+
+```{r, fig.height=3, fig.width=7.5}
+(s3_top <- cowplot::plot_grid(s3_anno, s3_avsig, NULL, 
+                              labels = c("A", "B", ""),
+                              label_size = 12,
+                              label_fontfamily = "Arial",
+                              label_fontface = "bold",
+                              nrow = 1,
+                              rel_widths = c(3/7.5, 4/7.5, 0.5/7.5)))
+```
+
+```{r, fig.height=5.5, fig.width=7.5}
+(fig_s3 <- cowplot::plot_grid(s3_top, 
+                   cor_peakCategory_scatterplot +
+                     theme(text = element_text(size = 8)), 
+                   label_fontface = "bold",
+                   label_fontfamily = "Arial",
+                   label_size = 12,
+                   labels = c("", "C"),
+                   ncol = 1,
+                   rel_heights = c(3/5, 2.5/5)))
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+# Motif Search
+
+
+# Denovo Motifs revisited 
+
+```{r}
+chip_category_dreme_transpose <- chip_category_seq_narrow.v.shuffle_dreme %>% 
+  transpose 
+
+
+get_pfm <- function(pwm){
+  testthat::expect_s4_class(pwm, "pfm")
+  pwm@mat %>% 
+    PWMEnrich::toPWM() %>% 
+    .@pfm
+}
+
+pwme_pfm_cor_mat <- function(pfm_list, trim = 0){
+  # Takes list of pfms and returns correlation matrix 
+  # using PWMEnrich similarity algorithm
+  corMat <- map_dfr(pfm_list, ~{
+    pfm <- .x
+    map_dfc(pfm_list, PWMEnrich::motifSimilarity, pfm, trim = trim)
+  }, .id = "id") %>% 
+    tibble::column_to_rownames("id") %>% 
+    as.matrix()
+  
+  return(corMat)
+}
+
+chip_category_dreme_corMat <- chip_category_dreme_transpose$motifs %>% 
+  {
+    M <- .
+    names(M) <- gsub("_endogenous", "", names(M))
+    return(M)
+  } %>% 
+  unlist %>% 
+  map(., get_pfm) %>% 
+  pwme_pfm_cor_mat()
+
+```
+
+## Similarity of all DREME Motifs From Peak binding types
+```{r, fig.height=10, fig.width=12}
+anno <- data.frame("name" = colnames(chip_category_dreme_corMat)) %>% 
+  tidyr::separate(name, c("Peak Type", "seq"), remove = F) %>% 
+  dplyr::select(-seq) %>% 
+  tibble::column_to_rownames("name")
+
+anno_col <- list(
+            "Peak Type" = binding_colors_faire[names(binding_colors_faire) != "faire"]
+)
+
+pheatmap::pheatmap(chip_category_dreme_corMat, 
+                   color = colorRampPalette(blues9)(255), 
+                   annotation_col = anno, 
+                   annotation_colors = anno_col,
+                   main = "De novo motif similarity") 
+```
+Phylogeny w/ Motifstack
+```{r, fig.height=15, fig.width=20}
+
+chip_category_dreme_transpose$motifs %>% 
+  {
+    M <- .
+    names(M) <- gsub("_endogenous", "", names(M))
+    return(M)
+  } %>% 
+  unlist %>% 
+  imap(., ~{
+    mat <- .x
+    name <- .y
+    
+    type <- stringr::str_split_fixed(name, "\\.", 2) %>% .[,1]
+    
+    mat@name <- paste(type, mat@name, sep = "_")
+    mat@name <- type
+    
+    return(mat)
+    #return(type)
+  }) %>% 
+  motifStack::motifStack(., layout = "phylog")
+```
+## use ggdendro to redraw phylog tree
+
+```{r}
+motif_dendrogram <- function(pfms, method = "average"){
+  
+  dist <- MotIV::motifDistances(lapply(pfms, motifStack::pfm2pwm))
+  
+  #hc <- MotIV::motifHclust(dist, method = method)
+  hc <- hclust(dist)
+  dend_data <- ggdendro::dendro_data(hc)
+  
+  return(dend_data)
+}
+```
+
+```{r}
+denovo_dend_data <- chip_category_dreme_transpose %>% 
+  transpose %>% 
+  map(., "motifs") %>% 
+  imap(., ~{
+    # append peak type to motif name
+    motifs <- .x
+    name <- .y
+    
+    pasteName <- function(x, name){
+      x@name <- paste0(name, ".", x@name)
+      return(x)
+    }
+    
+    motifs_rename <- map(motifs, pasteName, name = name)
+    
+    return(motifs_rename)
+  }) %>% 
+  unlist() %>% 
+  motif_dendrogram() %>% 
+  {
+    dat <- .
+    dat$labels %<>% 
+      tidyr::separate(label, c("type", "motif"), sep = "\\.", remove = F) %>% 
+      toOrphan(label) %>% 
+      toOrphan(type)
+    
+    return(dat)
+  }
+```
+
+
+```{r, fig.width=4, fig.height=5}
+(denovo_dendro_plot <- ggplot(denovo_dend_data$segments) +
+  geom_segment(aes(x = y/5, y = x, xend = yend/5, yend = xend)) +
+  geom_text(data = denovo_dend_data$labels,
+            aes(x = y - 0.02,
+                y = x,
+                label = label,
+                color = type), hjust = 0) +
+  scale_color_manual(values = binding_colors_faire) +
+  theme_nothing() +
+  scale_x_reverse(limits = c(0.2,-0.4)))
+```
+
+```{r, fig.height=15, fig.width=2}
+denovo_pfms <- chip_category_dreme_transpose %>% 
+  transpose %>% 
+  {
+    x <- .
+    names(x) <- gsub("_endogenous", "", names(x))
+    return(x)
+  } %>% 
+  map(., "motifs") %>% 
+  unlist
+denovo_mat <- map(denovo_pfms, ~{.x@mat})
+
+denovo_dendro_pwm <- ggseqlogo::ggseqlogo(denovo_mat[denovo_dend_data$labels$label %>% rev], 
+                                           ncol = 1, method = "bits") +
+    theme_nothing()
+```
+```{r, fig.height=6, fig.width=4}
+(denovo_ggplot_dendStack <- cowplot::plot_grid(denovo_dendro_plot +
+                     theme_development,
+                   cowplot::plot_grid(
+                     NULL,
+                     denovo_dendro_pwm,
+                     NULL,
+                     rel_heights = c(0.03, 1, 0.03),
+                     ncol = 1
+                     ),
+                   rel_widths = c(3/4, 1/4), nrow = 1)
+                   #rel_widths = c(5,1), nrow = 1)
+)
+```
+
+
+```{r}
+denovo_phylog <- chip_category_dreme_transpose %>% 
+  transpose %>% 
+  map(., "motifs") %>% 
+  imap(., ~{
+    # append peak type to motif name
+    motifs <- .x
+    name <- .y
+    
+    pasteName <- function(x, name){
+      x@name <- paste0(name, ".", x@name)
+      return(x)
+    }
+    
+    motifs_rename <- map(motifs, pasteName, name = name)
+    
+    return(motifs_rename)
+  }) %>% 
+  unlist() %>% 
+  purrr::set_names(function(x) gsub("_endogenous", "", x)) %>% 
+  {
+    pfms <- .
+    MotIV::motifDistances(lapply(pfms, motifStack::pfm2pwm)) %>% 
+      MotIV::motifHclust(., method = "average") %>% 
+      hclust2phylog(.)
+  }
+
+denovo_pfms <- chip_category_dreme_transpose %>% 
+  transpose %>% 
+  {
+    x <- .
+    names(x) <- gsub("_endogenous", "", names(x))
+    return(x)
+  } %>% 
+  map(., "motifs") %>% 
+  imap(., ~{
+    motifs <- .x
+    name <- .y
+    
+    pasteName <- function(x, name){
+      x@name <- paste0(name, ".", x@name)
+      return(x)
+    }
+    
+    motifs_rename <- map(motifs, pasteName, name = name)
+    
+    return(motifs_rename)
+  }) %>% 
+  unlist
+```
+
+# Fig S5
+
+```{r, fig.height=4, fig.width=5}
+anno <- data.frame("name" = colnames(chip_category_dreme_corMat)) %>% 
+  tidyr::separate(name, c("Peak Type", "seq"), remove = F) %>% 
+  dplyr::select(-seq) %>% 
+  tibble::column_to_rownames("name")
+
+anno_col <- list(
+            "Peak Type" = binding_colors_faire[names(binding_colors_faire) != "faire"]
+)
+
+dreme_corMat_heatmap <- pheatmap::pheatmap(chip_category_dreme_corMat, 
+                   color = colorRampPalette(blues9)(255), 
+                   annotation_col = anno, 
+                   annotation_colors = anno_col, 
+                   fontsize = 8,
+                   treeheight_col = 10,
+                   treeheight_row = 10, 
+                   border_color = NA,
+                   main = "De novo motif similarity") 
+```
+
+```{r, fig.height=5, fig.width=3.5}
+denovo_ggplot_dendStack
+```
+
+```{r, fig.height=4, fig.width=10}
+#W <- 9.5
+#W <- 8.5
+#W <- 7
+W <- 10
+(s5_top <- cowplot::plot_grid(dreme_corMat_heatmap$gtable,
+                   denovo_ggplot_dendStack,
+                   nrow = 1,
+                   labels = c("A", "B"),
+                   label_fontfamily = "Arial",
+                   label_size = 12,
+                   #rel_widths = c(6/W, 3.5/W)))
+                   rel_widths = c(5/W, 5/W)))
+```
+```{r}
+library(grid)
+library(gridExtra)
+table_res <- chip_category_dreme_transpose$info %>% 
+  dplyr::bind_rows(.id = "type") %>% 
+  toOrphan(type) %>% 
+  tidyr::unite("motif", c(type, seq), sep = "_", remove = F) %>% 
+  dplyr::mutate("% Positive" = round(pos_frac * 100, digits = 0),
+                "% Negative" = round(neg_frac * 100, digits = 0)) %>% 
+  dplyr::select(motif, bestMatch, pvalue, matches("%")) %>% 
+  dplyr::filter(motif %in% c("orphan_AATWAA",
+                             "ectopic_AGMGAGMG",
+                             "entopic_GARMGAGA",
+                             "orphan_CCHCCBCC",
+                             "entopic_CCMCCNCC")) %>% 
+  dplyr::mutate(bestMatch = case_when(grepl("orphan_AATWAA", motif) ~ "Homeobox TF",
+                                      T ~ bestMatch))
+
+s5_table <- grid.grabExpr(
+  gridExtra::grid.table(table_res,
+                        rows = NULL,
+                        theme = ttheme_minimal(base_size = 8))
+)
+```
+```{r, fig.height=2, fig.width=5}
+grid.arrange(s5_table)
+```
+
+### Wing expressed TFs/Genes
+```{r}
+#wing_fpkm <- readxl::read_excel("Data/GSE97956_geneFPKMs_L3_24hr_44hr.xlsx")
+wing_fpkm <- readr::read_csv("Data/GSE77562_RPKM_allgenes_alltimepoints.csv.gz", 
+                             col_names = c("gene_symbol",
+                                           "APF0h_1",
+                                           "APF0h_2",
+                                           "APF6h_1",
+                                           "APF6h_2",
+                                           "APF18h_1",
+                                           "APF18h_2",
+                                           "APF24h_1",
+                                           "APF24h_2",
+                                           "APF36h_1",
+                                           "APF36h_2",
+                                           "APF44h_1",
+                                           "APF44h_2"), skip = 1)
+
+wing_expressed_genes <- wing_fpkm %>% 
+  tidyr::pivot_longer(names_to = "Time",
+                      values_to = "FPKM", cols = matches("APF")) %>% 
+  tidyr::separate(Time, c("Time", "Rep")) %>% 
+  dplyr::group_by(gene_symbol, Time) %>% 
+  dplyr::summarise(FPKM = mean(FPKM)) %>% 
+  dplyr::filter(FPKM > 5)
+
+
+wing_expressed_genes_uniq <- wing_expressed_genes$gene_symbol %>% 
+  unique
+```
+```{r}
+ame_res_df %>% 
+  ame_get_tfid() %>% 
+  toOrphan(type) %>% 
+  dplyr::filter(rank %in% 1:25) %>% 
+  ame_plot_ordered_heatmap() +
+    theme_development
+
+ame_res_df %>% 
+  ame_get_tfid() %>% 
+  toOrphan(type) %>% 
+  dplyr::filter(rank %in% 1:25) %>% 
+  dplyr::filter(tolower(tfid) %in% tolower(wing_expressed_genes_uniq)) %>% 
+  ame_plot_ordered_heatmap() +
+    theme_development
+
+ame_res_df %>% 
+  ame_get_tfid() %>% 
+  toOrphan(type) %>% 
+  dplyr::filter(tolower(tfid) %in% tolower(wing_expressed_genes_uniq)) %>% 
+  dplyr::filter(tfid != "en") %>% 
+  ame_plot_ordered_heatmap() +
+    theme_development
+```
+
+
+```{r, fig.width=10, fig.height=2}
+w <- 7
+W <- 10
+(s5_bottom <- cowplot::plot_grid(
+  s5_table,
+  ame_res_df %>% 
+    ame_get_tfid() %>% 
+    toOrphan(type) %>% 
+    dplyr::filter(tolower(tfid) %in% tolower(wing_expressed_genes_uniq)) %>% 
+    dplyr::filter(tfid != "en") %>% 
+    ame_plot_ordered_heatmap() +
+      theme_development,
+  labels = c("C", "D"),
+  label_size = 12,
+  label_fontface = "bold",
+  rel_widths = c(4.5/W, 5.5/W),
+  nrow = 1
+))
+```
+
+```{r, fig.height=6, fig.width=10}
+H <- 6
+cowplot::plot_grid(s5_top,
+                   s5_bottom,
+                   rel_heights = c(4/H, 2/H),
+                   ncol = 1)
+
+```
+
+# Motif Searching
+```{r}
+dm3.genome <- BSgenome.Dmelanogaster.UCSC.dm3::BSgenome.Dmelanogaster.UCSC.dm3
+```
+
+## Denovo motif enrichment in E93-sensitive sites
+```{r}
+e93_sens_fa <- unionChip_anno %>% 
+  tidyr::unite(response, c(e93_sensitive, e93_sensitive_behavior)) %>% 
+  dplyr::filter(!grepl("NA", response)) %>% 
+  GRanges %>% 
+  computeSummits() %>% 
+  resize(200, "center") %>% 
+  split(mcols(.)$response) %>% 
+  write_fasta_of_region("Motif_Data/e93_sensitive_response", resize_bp = 0)
+```
+
+```{r, eval=F}
+denovo_e93sens_vs_static <- map(e93_sens_fa[2:3], ~{
+  motifAnalysis(.x, e93_sens_fa$insensitive_Static)
+})  
+
+save(denovo_e93sens_vs_static, file = "Data/e93sens_v_static_denovo_res.rda")
+```
+
+```{r}
+load(file = "Data/e93sens_v_static_denovo_res.rda")
+
+denovo_e93sens_vs_static$sensitive_Decreasing$info %>% 
+  dplyr::select(id, bestMatch, pos_frac, neg_frac)
+
+denovo_e93sens_vs_static$sensitive_Increasing$info %>% 
+  dplyr::select(id, bestMatch, pos_frac, neg_frac)
+```
+
+```{r}
+denovo_e93sens_v_static_res <- denovo_e93sens_vs_static %>% 
+  map_dfr("info", .id = "type") %>% 
+  split(.$type)
+
+```
+
+# Fig S7
+
+
+```{r, fig.height=2.5, fig.width=3}
+(s7_denovo_e93_sens_v_static_barplots <- denovo_e93sens_v_static_res %>% 
+  map(., ~{
+    .x %>% 
+      dplyr::mutate(tfid = gsub("_.+", "", bestMatch)) %>% 
+      dplyr::mutate(type = gsub("_", "\n", Hmisc::capitalize(type))) %>% 
+      dplyr::mutate(tfid = factor(tfid) %>% 
+                      fct_reorder(., id)) %>% 
+      dplyr::mutate(tt_qval = map(tomtom, "q_value"),
+                    match_qval = map_dbl(tt_qval, ~{.x[1]})) %>% 
+      ggplot(aes(tfid, pos_frac / neg_frac)) +
+        geom_col(aes(fill = -log10(match_qval)), color = "black") +
+        facet_wrap(~type) +
+        theme(axis.text.x = element_text(angle = 45, hjust = 1)) +
+        scale_y_continuous(expand = expansion(mult = c(0, 0.5))) +
+        scale_fill_gradient(low = "white",
+                            high = "firebrick") +
+        labs(x = "Best Matched Motif",
+             y = "Enrichment Ratio",
+             fill = "Match Accuracy\n(-log10(qValue))") +
+        theme_development
+    
+  })
+)
+
+```
+
+
+```{r, fig.height=5.5, fig.width=5}
+source("Scripts/development_denovo_matches.R")
+source("Scripts/Nystlib/R/plot_utils.R")
+
+s7_denovo_e93sens_vs_static_motifPlots <- map(denovo_e93sens_vs_static, 
+                                               plot_denovo_matches_development, 
+                                               titles = T) %>% 
+   imap(., ~{
+     
+     title <- gsub("_", " ", .y) %>% 
+       Hmisc::capitalize()
+     
+     cowplot::plot_grid(cowplot_title(.x$denovo, "de novo", 
+                                      fontface = "bold.italic", 
+                                      rel_heights = c(0.05, 1), 
+                                      size = 8), 
+                        cowplot_title(.x$match, "match", 
+                                      fontface = "bold", 
+                                      rel_heights = c(0.05, 1), 
+                                      size = 8),
+                        nrow = 1,
+                        labels = c("A", ""),
+                        label_size = 12,
+                        label_fontface = "bold") %>% 
+       cowplot_title(., title, fontface = "bold", rel_heights = c(0.05, 1), size = 8)
+   })
+```
+
+```{r, fig.height=4.5, fig.width=7}
+W <- 8
+H <- 4.5
+h <- 3.0
+(s7_denovo_e93sens_panels <- map2(s7_denovo_e93sens_vs_static_motifPlots,
+     s7_denovo_e93_sens_v_static_barplots, ~{
+      
+      cowplot::plot_grid(.x,
+                         cowplot::plot_grid(
+                            NULL,
+                            .y, 
+                            NULL,
+                            ncol = 1,
+                            labels = c("", "B"),
+                            rel_heights = c((H - h)/H, h/H, (H - h)/H)
+                         ),
+                         nrow = 1, rel_widths = c(4/W, 3/W))
+            
+    }))
+```
+
+# K motifs using all other dynamic K as background
+Clusters 1-5 are dynamic. Scan for motifs within dynamic clusters using all other dynamic cluster as background to maximize sensitivity for temporal-specific motifs.
+```{r}
+# filter out each set
+# so no_k5.fa, no_k4.fa, etc.
+# 
+
+path <- "motif_data/k_fasta_dynamicOnly"
+no_k_dyn_fa <- map(1:5, ~{
+  
+  fa_name <- glue::glue("{path}/no_k{.x}.fa")
+  
+  uca_k %>% 
+    dplyr::filter(k != .x) %>% 
+    GRanges %>% 
+    computeSummits %>% 
+    resize(100, "center") 
+    
+}) %>% 
+  purrr::set_names(1:5) %>% 
+  purrr::set_names(., function(x){glue::glue("no_k{x}")}) %>% 
+  write_fasta_of_region(., outdir = path)
+  
+```
+
+```{r, eval=F}
+k_vs_dynamic_k_ame <- map2(uca_k_fasta[1:5], no_k_dyn_fa, ~{
+  runAmev5(.x, .y, meme_path = "~/meme_5.1.0/")
+})
+save(k_vs_dynamic_k_ame, file = "Data/k_vs_dynamic_k_ame.rda")
+```
+
+```{r}
+load(file = "Data/k_vs_dynamic_k_ame.rda")
+k_vs_dynamic_k_ame_res <- k_vs_dynamic_k_ame %>% 
+  transpose %>% 
+  {map_dfr(.$tsv, readr::read_tsv, comment = "#", .id = "type")} %>% 
+  dplyr::rename_all(function(x){gsub("-", ".", x)})
+```
+
+```{r, fig.height=25, fig.width=5}
+k_vs_dynamic_k_ame_res %>% 
+  ame_get_tfid() %>% 
+  ame_get_best_tfid() %>% 
+  ame_order_by_cluster() %>% 
+  dplyr::filter(nType <= 3) %>% 
+  ggplot(aes(reorder(tfid, order), type)) +
+    geom_tile(aes(fill = -log10(adj_p.value)), color = 'black', size = 0.3) +
+    theme_bw() +
+    theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+            axis.text = element_text(color = "black",
+                                     size = 34 / .pt)) +
+      labs(x = NULL,
+           y = NULL,
+           fill = "-log10(p.adj)") +
+      scale_fill_gradient2(low = "white",
+                           mid = "firebrick",
+                           high = "firebrick",
+                           midpoint = 15) +
+    coord_flip()
+```
+
+# Fig S8
+```{r, fig.height=4.1, fig.width=3.54}
+k_vs_dynamic_k_ame_res %>% 
+  ame_get_tfid() %>% 
+  ame_get_best_tfid() %>% 
+  dplyr::mutate(gene_id = gsub("-.+", "", tfid)) %>% 
+  dplyr::filter(tolower(gene_id) %in% tolower(wing_expressed_genes_uniq)) %>% 
+  ame_order_by_cluster() %>% 
+  dplyr::filter(nType <= 3) %>% 
+  split(.$nType) %>% 
+  map2(., c(5, 15, 10) ,~{
+    .x %>% 
+      ggplot(aes(reorder(tfid, order), type)) +
+        geom_tile(aes(fill = -log10(adj_p.value)), color = 'black', size = 0.3) +
+        theme_bw() +
+        theme(axis.text.x = element_text(angle = 90, hjust = 1, vjust = 0.5),
+              axis.text = element_text(color = "black",
+                                       size = 34 / .pt)) +
+        labs(x = NULL,
+             y = NULL,
+             fill = "-log10(p.adj)") +
+        scale_fill_gradient2(low = "white",
+                             mid = "firebrick",
+                             high = "firebrick", 
+                             midpoint = .y) +
+        coord_flip() +
+        facet_wrap(~nType) +
+        theme_development
+    
+  }) -> s8_amePanels
+s8_amePanels
+```
+```{r, fig.height=8.2, fig.width=7.08}
+cowplot::plot_grid(plotlist = s8_amePanels, labels = "AUTO", label_size = 12, label_fontfamily = "Arial")
+```
+
+
+# E93 motif within sensitive sites
+
+```{r}
+source("Scripts/plot_motif_stats.R")
+
+e93.20.stats <- e93sens_plot_motif_stats(summit_uca_e93Motif, e93_core_fimo,
+                         motif_name = "E93")
+
+```
+
+
+
+```{r, fig.height=3, fig.width=3}
+(e93sens_motifs_pie <- e93.20.stats$pie$binary$data %>% 
+  dplyr::mutate(e93_sensitive_behavior = gsub("Static", "Insensitive", e93_sensitive_behavior)) %>% 
+  dplyr::mutate(nHits = map_dbl(motif_qVal, length)) %>% 
+  dplyr::filter(!is.na(e93_sensitive_behavior)) %>% 
+  ggplot(aes(factor("Peaks"))) +
+  geom_bar(aes(fill = nHits > 0,
+               color = nHits > 0), position = "fill") +
+  facet_wrap(~e93_sensitive_behavior, ncol = 2) +
+  coord_polar(theta = "y", start = 0) +
+  labs(x = NULL, 
+       y = NULL,
+       title = "Fraction of E93 sites\ncontaining an E93 motif",
+       fill = glue::glue("{motif_name} Matches", motif_name = "E93 Motif\n")) +
+  theme_minimal() +
+  theme_development +
+  theme(axis.text = element_blank(), 
+        panel.grid = element_blank(), 
+        plot.title = element_text(size = 8, hjust = 0.5),
+        legend.position = c(0.8, 0.25)) +
+  guides(color = F) +
+         #fill = guide_legend(keywidth = unit(0.4, "lines"),
+         #                    keyheight = unit(0.4, "lines"))) +
+  scale_fill_manual(values = c("TRUE" = "Firebrick",
+                               "FALSE" = "Black"),
+                    labels = c("TRUE" = "Match",
+                               "FALSE" = "No Match")) +
+  scale_color_manual(values = c("TRUE" = "Firebrick",
+                               "FALSE" = "Black"),
+                    labels = c("TRUE" = "Match",
+                               "FALSE" = "No Match"))
+)
+```
+
+```{r, fig.height=3, fig.width=3}
+sens_behavior_colors <- behavior_colors
+names(sens_behavior_colors)[3] <- "Insensitive"
+
+(e93sens_motifs_dist <- e93.20.stats$pie$count$data %>% 
+  dplyr::mutate(e93_sensitive_behavior = gsub("Static", "Insensitive", e93_sensitive_behavior)) %>% 
+  dplyr::group_by(nHits, e93_sensitive_behavior) %>% 
+  dplyr::count() %>% 
+  dplyr::group_by(e93_sensitive_behavior) %>% 
+  dplyr::mutate(frac = n/sum(n)) %>% 
+  ggplot(aes(nHits, frac)) +
+    geom_line(aes(color = e93_sensitive_behavior), size = 1) +
+    labs(color = "E93 Response",
+         y = "Fraction of Sites",
+         x = "Number of E93 Motifs") +
+    scale_x_continuous(breaks = 0:6) +
+    scale_color_manual(values = sens_behavior_colors) +
+    theme(legend.position = c(0.5, 0.5)) +
+    theme_development +
+    guides(color = guide_legend(override.aes = list(size = 1),
+                                keyheight = unit(0.01, "lines"), 
+                                label.theme = element_text(size = 8, family = "Arial")))
+)
+```
+```{r, fig.height=3, fig.width=2}
+(e93sens_qual_violin <- e93.20.stats$all_boxplot$data %>% 
+  dplyr::mutate(e93_sensitive_behavior = gsub("Static", "Insensitive", e93_sensitive_behavior)) %>% 
+  ggplot(aes(e93_sensitive_behavior, -log10(motif_qVal))) +
+  geom_violin(aes(fill = e93_sensitive_behavior)) +
+  geom_boxplot(width = 0.10, outlier.size = 0.8) +
+  scale_fill_manual(values = sens_behavior_colors) +
+  guides(fill = F) +
+  labs(x = NULL,
+       y = "-log10(motif q-value)",
+       title = glue::glue("All E93 Motif Matches")) +
+  theme_development +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1),
+        plot.title = element_text(size = 8, face = "plain"))
+)
+```
+
+```{r}
+tukey_to_anno <- function(tukey, lvls = names(binding_colors)){
+  # Converts results from TukeyHSD test to data.frame
+  # for making annotations on ggplots
+  tukey %>% 
+  broom::tidy() %>% 
+  tidyr::separate(comparison, c("c1", "c2"), sep = "-", remove = F) %>% 
+  dplyr::mutate(c1 = factor(c1, levels = lvls),
+                c2 = factor(c2, levels = lvls)) %>% 
+  dplyr::mutate(c1 = as.integer(c1),
+                c2 = as.integer(c2))
+    
+}
+```
+
+```{r, fig.height=3, fig.width=2}
+
+e93sens_qual_anno <- e93sens_qual_violin$data %>% 
+  aov(motif_qVal ~ e93_sensitive_behavior, data = .) %>% 
+  TukeyHSD() %>% 
+  tukey_to_anno(lvls = c("Decreasing", "Increasing", "Insensitive")) %>% 
+  dplyr::mutate(y = c(12.5, 13, 13.5),             # manually set height of bar
+                label_x = c2 + ((c1 - c2)/2), # put label at midpoint
+                label_y = y + 0.20,           # nudge label on y
+                label = case_when(adj.p.value < 0.015 ~ "**",
+                                  adj.p.value < 0.05 ~ "*",
+                                  adj.p.value > 0.05 ~ "n.s."),
+                label_size = ifelse(grepl("*", label), 18 / .pt, 12 / .pt)) # make * labels larger
+
+(e93_sens_qual_violin_anno <- e93sens_qual_violin +
+  geom_segment(data = e93sens_qual_anno, aes(x = c1, xend = c2, y = y, yend = y)) +
+  geom_text(data = e93sens_qual_anno, aes(x = label_x, y = label_y, label = label, size = label_size)) +
+  theme(legend.position = "none")
+)
+```
+```{r, fig.height=6, fig.width=6}
+H <- 6
+W <- 6
+t <- cowplot::plot_grid(e93sens_motifs_pie, 
+                        e93sens_motifs_dist, 
+                        labels = c("A", "B"), 
+                        label_fontfamily = "Arial", 
+                        label_size = 12,
+                        ncol = 2)
+b <- cowplot::plot_grid(e93_sens_qual_violin_anno,
+                        NULL, 
+                        ncol = 2, 
+                        labels = c("C", ""), 
+                        label_fontfamily = "Arial", 
+                        label_size = 12,
+                        rel_widths = c(2/W, (W-2)/W))
+
+cowplot::plot_grid(t, b, ncol = 1)
+```
+
+
+
+## TF Fracmax
+```{r, fig.height=3, fig.width=4.5}
+wing_expressed_genes %>% 
+  dplyr::mutate(hour = gsub("APF(\\d+)h", "\\1APF", Time),
+                hour = gsub("0APF", "3LW", hour),
+                hour = factor(hour, levels = developmental_time_factor_nozero)) %>% 
+  dplyr::group_by(gene_symbol) %>% 
+  dplyr::mutate(fracMax = FPKM/max(FPKM)) %>% 
+  dplyr::filter(gene_symbol %in% c("vfl", "br", "nub", "crol", "Eip93F", "Abd-A")) %>% 
+  dplyr::ungroup() %>% 
+  dplyr::mutate(gene_symbol = gsub("vfl", "Zld", gene_symbol)) %>% 
+  dplyr::mutate(gene_symbol = forcats::fct_relevel(gene_symbol,
+                                                   c("br", "crol", "Eip93F",
+                                                     "Zld", "nub"))) %>% 
+  ggplot(aes(hour, fracMax)) +
+    geom_line(aes(group = gene_symbol)) +
+    facet_wrap(~gene_symbol, ncol = 3) +
+    labs(x = "Developmental Time",
+         y = "Fraction of Max Expression") +
+    theme_development +
+    theme(axis.text.x = element_text(angle = 45, hjust = 1)) 
+```    
+
+# Session Info
+```{r}
+sessionInfo()
+```
+

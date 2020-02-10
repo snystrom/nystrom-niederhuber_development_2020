@@ -1,0 +1,3 @@
+Genotype	Type	Time	Tissue	Bam	Peakfile	BigwigZnorm
+OR	E93.WT	24APF	Wing	ChIP_Data/Data/Bam/E93-24APF-Wing-ChIP_2Reps_POOLED_q5_sorted_dupsRemoved_noYUHet.bam	ChIP_Data/Data/Peakfiles/E93-24APF-Wing-ChIP_2Reps_ChIP_PooledPeaks_peaks.narrowPeak	ChIP_Data/Data/BigWigs/ZNormalized/E93-24APF-Wing-ChIP_2Reps_POOLED_q5_sorted_dupsRemoved_noYUHet_normalizedToRPGC_zNorm.bw
+E93GOF	E93.GOF	3LW	Wing	ChIP_Data/Data/Bam/E93-GOF-ChIP_2Reps_POOLED_q5_sorted_dupsRemoved_noYUHet.bam	ChIP_Data/Data/Peakfiles/E93-GOF-ChIP_2Reps_ChIP_PooledPeaks_peaks.narrowPeak	ChIP_Data/Data/BigWigs/ZNormalized/E93-GOF-ChIP_2Reps_POOLED_q5_sorted_dupsRemoved_noYUHet_normalizedToRPGC_zNorm.bw

@@ -1,0 +1,1 @@
+mm_to_pt <- function(mm) convertUnit(unit(mm, "mm"), "pt", valueOnly = T)
