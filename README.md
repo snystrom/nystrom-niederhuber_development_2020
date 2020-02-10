@@ -2,7 +2,7 @@
 ## Analysis Code
 ## Spencer Nystrom
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3660090.svg)](https://doi.org/10.5281/zenodo.3660090)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.3660089.svg)](https://doi.org/10.5281/zenodo.3660089)
 
 ## To rerun code
 First run `R_Pipeline/00_Runall.R`
